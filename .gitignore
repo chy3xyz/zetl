@@ -1,0 +1,22 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+*.o
+*.a
+
+# zetl 运行时产物
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+zetl_meta.db
+
+# 日志
+*.log
+
+# 本地配置/密钥(按需)
+config.local.toml
+.env
+
+# macOS
+.DS_Store
