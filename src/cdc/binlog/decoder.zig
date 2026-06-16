@@ -54,6 +54,7 @@ pub fn decodeColumn(
         0x08 => decodeInt(allocator, 8, body, pos),
         0x0f => decodeVarchar(allocator, metadata, body, pos),
         0x0c => decodeDatetime(allocator, body, pos),
+        0x12 => decodeDatetime2(allocator, metadata, body, pos),
         else => return error.UnsupportedType,
     };
 }
@@ -114,6 +115,57 @@ fn decodeDatetime(allocator: std.mem.Allocator, body: []const u8, pos: *usize) D
     const minute: u64 = @divFloor(rem2, 64);
     const second: u64 = rem2 % 64;
     return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ year, month, day, hour, minute, second }) catch return error.OutOfMemory;
+}
+
+fn decodeDatetime2(allocator: std.mem.Allocator, metadata: []const u8, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (metadata.len < 1) return error.InvalidValue;
+    const fsp: u8 = metadata[0];
+    if (fsp > 6) return error.InvalidValue;
+
+    const int_bytes: usize = 5;
+    const frac_bytes: usize = @intCast(@divFloor(fsp + 1, 2));
+    if (body.len < pos.* + int_bytes + frac_bytes) return error.BufferTooShort;
+
+    // Read 5-byte big-endian packed datetime via readInt.
+    // Zig has no u40 builtin; shift manually.
+    var packed_int: u64 = 0;
+    var i: usize = 0;
+    while (i < int_bytes) : (i += 1) {
+        packed_int = (packed_int << 8) | body[pos.* + i];
+    }
+    pos.* += int_bytes;
+
+    // ymd = (year * 13 + month) * 32 + day, occupies high 22 bits
+    const ymd: u64 = packed_int >> 17;
+    const ym: u64 = ymd >> 5;
+    const year: u64 = ym / 13;
+    const month: u64 = ym % 13;
+    const day: u64 = ymd & 0x1F;
+
+    // hms occupies low 17 bits
+    const hms: u64 = packed_int & ((@as(u64, 1) << 17) - 1);
+    const hour: u64 = hms >> 12;
+    const minute: u64 = (hms >> 6) & 0x3F;
+    const second: u64 = hms & 0x3F;
+
+    // frac part is big-endian
+    var frac_int: u64 = 0;
+    i = 0;
+    while (i < frac_bytes) : (i += 1) {
+        frac_int = (frac_int << 8) | body[pos.* + i];
+    }
+    pos.* += frac_bytes;
+
+    if (fsp == 0) {
+        return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ year, month, day, hour, minute, second }) catch return error.OutOfMemory;
+    }
+
+    // fsp 1..5: MySQL stores fractional value already pre-scaled to a 3-byte field,
+    // but the scaling depends on fsp. For fsp=6 (3 bytes), the value IS microseconds.
+    // For fsp<6, we left-shift the stored value by (3 - frac_bytes) * 8 bits and pad zeros.
+    const shift: u6 = @intCast((3 - frac_bytes) * 8);
+    const microseconds: u64 = frac_int << shift;
+    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ year, month, day, hour, minute, second, microseconds }) catch return error.OutOfMemory;
 }
 
 test "decodeColumn for TINY returns decimal" {
@@ -180,6 +232,47 @@ test "decodeColumn for DATETIME reads 8-byte packed date" {
     const time_int: u64 = 56 + 34 * 64 + 12 * 64 * 64;
     std.mem.writeInt(u64, &buf, date_int << 32 | time_int, .little);
     const out = try decodeColumn(std.testing.allocator, 0x0c, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("2026-06-15 12:34:56", out);
+}
+
+test "decodeColumn for DATETIME2(6) reads 5+3-byte packed date" {
+    var pos: usize = 0;
+    // 2026-06-15 12:34:56.123456 packed per real MySQL formula:
+    // packed_int = (year*13 + month)*2^17 | (day << 17) | (hour << 12) | (min << 6) | sec
+    const ymd: u64 = (2026 * 13 + 6) * 32 + 15;
+    const hms: u64 = (12 << 12) | (34 << 6) | 56;
+    const packed_int: u64 = ymd << 17 | hms;
+    var buf: [8]u8 = undefined;
+    // 5 bytes big-endian
+    buf[0] = @intCast((packed_int >> 32) & 0xff);
+    buf[1] = @intCast((packed_int >> 24) & 0xff);
+    buf[2] = @intCast((packed_int >> 16) & 0xff);
+    buf[3] = @intCast((packed_int >> 8) & 0xff);
+    buf[4] = @intCast(packed_int & 0xff);
+    // 3 bytes big-endian microseconds = 123456 (0x01E240)
+    buf[5] = 0x01;
+    buf[6] = 0xe2;
+    buf[7] = 0x40;
+    const meta = [_]u8{6};
+    const out = try decodeColumn(std.testing.allocator, 0x12, &meta, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("2026-06-15 12:34:56.123456", out);
+}
+
+test "decodeColumn for DATETIME2(0) emits no fraction" {
+    var pos: usize = 0;
+    const ymd: u64 = (2026 * 13 + 6) * 32 + 15;
+    const hms: u64 = (12 << 12) | (34 << 6) | 56;
+    const packed_int: u64 = ymd << 17 | hms;
+    var buf: [5]u8 = undefined;
+    buf[0] = @intCast((packed_int >> 32) & 0xff);
+    buf[1] = @intCast((packed_int >> 24) & 0xff);
+    buf[2] = @intCast((packed_int >> 16) & 0xff);
+    buf[3] = @intCast((packed_int >> 8) & 0xff);
+    buf[4] = @intCast(packed_int & 0xff);
+    const meta = [_]u8{0};
+    const out = try decodeColumn(std.testing.allocator, 0x12, &meta, &buf, &pos);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("2026-06-15 12:34:56", out);
 }
