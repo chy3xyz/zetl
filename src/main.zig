@@ -105,6 +105,7 @@ test {
     _ = @import("cdc/poller.zig");
     _ = @import("cdc/mod.zig");
     _ = @import("cdc/binlog/position.zig");
+    _ = @import("cdc/binlog/parser.zig");
     _ = @import("transform/mapper.zig");
     _ = @import("transform/commission.zig");
     _ = @import("transform/engine.zig");
