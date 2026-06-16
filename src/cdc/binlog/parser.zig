@@ -226,9 +226,6 @@ pub const Parser = struct {
                 try used_columns.append(self.allocator, i);
             }
         }
-        const num_used = used_columns.items.len;
-        const null_bitmap_len = (num_used + 7) / 8;
-
         var rows = std.ArrayList(event_mod.RowEvent).empty;
         errdefer {
             for (rows.items) |*r| r.deinit(self.allocator);
@@ -241,11 +238,6 @@ pub const Parser = struct {
         const num_rows: usize = @intCast(num_rows_p.value);
 
         for (0..num_rows) |_| {
-            // 每行: null_bitmap + used columns 的 value
-            if (body.len < pos + null_bitmap_len) return error.BufferTooShort;
-            const null_bitmap = body[pos..][0..null_bitmap_len];
-            pos += null_bitmap_len;
-
             var row = event_mod.RowEvent{
                 .op = .insert,
                 .table = try self.allocator.dupe(u8, tm.table),
@@ -258,23 +250,42 @@ pub const Parser = struct {
             // 字段填充完成后, row 所有权转给 rows (errdefer 链解除).
             {
                 errdefer row.deinit(self.allocator);
-                for (used_columns.items, 0..) |col_idx, used_idx| {
-                    if (isBitSet(null_bitmap, used_idx)) continue; // NULL 跳过
-
-                    const col_type = tm.column_types[col_idx];
-                    const value = try readColumnValue(self.allocator, col_type, body, &pos);
-
-                    const col_name = try std.fmt.allocPrint(self.allocator, "c{d}", .{col_idx});
-                    errdefer self.allocator.free(col_name);
-
-                    try row.fields.put(col_name, value);
-                }
+                try self.readRowInto(&row, tm, used_columns.items, body, &pos);
             }
 
             try rows.append(self.allocator, row);
         }
 
         return ParsedEvent{ .row = try rows.toOwnedSlice(self.allocator) };
+    }
+
+    /// 从 body 中读取一行的 null_bitmap 与 used_columns 指定列的字段值,
+    /// 填充到 row.fields 中. 列名固定为 `c{d}` 格式.
+    fn readRowInto(
+        self: *Parser,
+        row: *event_mod.RowEvent,
+        tm: TableMap,
+        used_columns: []const usize,
+        body: []const u8,
+        pos: *usize,
+    ) (ParseError || std.mem.Allocator.Error)!void {
+        const null_bitmap_len = (used_columns.len + 7) / 8;
+        if (body.len < pos.* + null_bitmap_len) return error.BufferTooShort;
+        const null_bitmap = body[pos.*..][0..null_bitmap_len];
+        pos.* += null_bitmap_len;
+
+        for (used_columns, 0..) |col_idx, used_idx| {
+            if (isBitSet(null_bitmap, used_idx)) continue; // NULL 跳过
+
+            const col_type = tm.column_types[col_idx];
+            const value = try readColumnValue(self.allocator, col_type, body, pos);
+            errdefer self.allocator.free(value);
+
+            const col_name = try std.fmt.allocPrint(self.allocator, "c{d}", .{col_idx});
+            errdefer self.allocator.free(col_name);
+
+            try row.fields.put(col_name, value);
+        }
     }
 };
 
