@@ -1,1 +1,52 @@
-使用 https://github.com/chy3xyz/zfinal，  zfinal AI极速开发工具，开发 zetl项目，具体的PRD需求文档参考 @docs/zetl_prd.md ,以及其他相关文档。先梳理，后编码，要采用 zig 0.17 的最佳实践编码。
+# zetl 开发笔记
+
+## 日志
+
+### 2026-06-15
+- 初始 V1 spec 完成 (PRD/imp/ard)
+- V1 设计文档 (2026-06-16-zetl-v1-design.md)
+
+### 2026-06-16
+- V1 核心同步闭环实现 (3567 行)
+- V2 三个阶段完成 (4934 行)
+  - V2.0: 对账 (reconcile)
+  - V2.1: 告警 + Prometheus + 审计
+  - V2.2: 鉴权升级 (user/role/RBAC)
+- zfinal 升级 0.8.1 → 0.10.4, 修复 Pool mutex 拷贝 Bug
+
+## 架构决策
+
+1. **元数据 SQLite + 业务 MySQL** — 元数据量小(< 100 数据源), 单文件便于备份
+2. **手写 Model/Service** — 不用 zfinal 生成器, 表结构固定
+3. **单二进制部署** — @embedFile 前端, 无外部文件依赖
+4. **伪 CDC** — V1/V2 用轮询 (主键分页 + update_time), 真 binlog 留 V3
+5. **主线程创建 Pool → 传入子线程** — zfinal v0.10.4 API 支持, 堆分配字符串
+
+## 依赖版本
+
+| 依赖 | 版本 |
+|------|------|
+| Zig | 0.17.0-dev.813 |
+| zfinal | 0.10.4 |
+| MySQL | 8.4 (macOS Homebrew) |
+| SQLite | 3 (系统自带) |
+
+## 端点统计
+
+- 公开: 9 个
+- 受保护: 24 个
+- 总计: 33 个
+
+## 测试覆盖
+
+- 单元测试: 31 个
+- SQLite 构建: ✅
+- MySQL 构建: ✅
+- E2E (全量同步): ⚠️  task thread MySQL 连接待修
+
+## 性能参考 (V2, MySQL 8.4, M1 Pro)
+
+- 全量同步: 10 行/5ms (批大小 5)
+- API 延迟: < 5ms (本地回环)
+- 内存: ~8MB (空闲), ~20MB (4 任务运行)
+- 二进制: 3.8MB

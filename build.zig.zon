@@ -1,0 +1,19 @@
+.{
+    .name = .zetl,
+    .version = "0.1.0",
+    .fingerprint = 0x648d07aed6eb036b,
+    .minimum_zig_version = "0.17.0",
+
+    .dependencies = .{
+        .zfinal = .{ .path = "../../zig_ws/zfinal" },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "config.toml",
+        "schema.sql",
+        "assets",
+    },
+}

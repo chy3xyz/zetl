@@ -1,0 +1,29 @@
+# zetl V2 E2E 测试配置 - 本地 MySQL 8.4
+
+[server]
+host = "0.0.0.0"
+port = 18080
+
+[meta]
+sqlite_path = "zetl_meta_e2e.db"
+admin_username = "admin"
+admin_password = "admin123"
+
+[sink]
+host = "127.0.0.1"
+port = 3306
+database = "zetl_sink"
+username = "root"
+password = ""
+pool_size = 8
+batch_size = 100
+flush_interval_ms = 500
+max_qps = 0
+
+[engine]
+full_sync_sleep_ms = 100
+incremental_poll_ms = 2000
+max_retries = 3
+
+[log]
+level = "info"

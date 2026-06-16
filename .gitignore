@@ -10,6 +10,7 @@ zig-out/
 *.db-shm
 *.db-wal
 zetl_meta.db
+zetl_meta_e2e.db
 
 # 日志
 *.log
@@ -20,3 +21,7 @@ config.local.toml
 
 # macOS
 .DS_Store
+
+# IDE
+.vscode/
+.idea/
