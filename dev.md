@@ -57,5 +57,6 @@
 
 ## 已知限制
 
-- **伪 CDC**: V1/V2 基于 `update_time` 轮询, 非真实 binlog; 物理删除无法感知, 源表需用 `is_delete=1` 软删除才会同步为删除.
+- **伪 CDC → 真 CDC**: V1/V2 基于 `update_time` 轮询; V3 新增真 binlog CDC (`sync_mode=binlog/both`), 可感知物理删除. 已落地为 phase 1, 详见 docs/superpowers/specs/2026-06-16-zetl-v3-binlog-cdc-design.md.
+- **V3 binlog parser phase 1**: 只解析整数 + VARCHAR 列类型, 其他类型跳过为 TODO; 不处理 binlog_checksum (需 `binlog_checksum=NONE`); UPDATE/DELETE 解析为 stub. SHOW MASTER STATUS 在 MySQL 8.0.22+ 改为 SHOW BINARY LOG STATUS.
 - **优雅停机**: ✅ zfinal v0.10.8 已修复; SIGTERM/SIGINT 可在 ~3s 内完成停机, 无 panic, 无泄漏.
