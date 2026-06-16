@@ -4,7 +4,8 @@
 //! 阶段 2 (Task 9): 解析 TABLE_MAP_EVENT (缓存 table_id → 表定义) +
 //!                   WRITE_ROWS_EVENT_V2 (生成 RowEvent 列表).
 //! 阶段 2 (Task 3): DELETE_ROWS_EVENT_V2 解析 (before image).
-//! 阶段 3 (后续): UPDATE_ROWS_EVENT + 更多 MySQL 字段类型解码.
+//! 阶段 2 (Task 4): UPDATE_ROWS_EVENT_V2 解析 (before/after 双镜像).
+//! 阶段 3 (后续): 更多 MySQL 字段类型解码.
 //!
 //! ## 支持的 MySQL 字段类型
 //! - INTEGER 家族 (统一按无符号小端读取, 输出十进制字符串):
@@ -19,7 +20,7 @@
 //!
 //! ## 限制
 //! - 仅支持 ROWS_EVENT v2 (MySQL 5.6+ 默认); v1 (0x17) 未实现
-//! - DELETE_ROWS_EVENT_V2 已解析, UPDATE_ROWS_EVENT 当前返回空 RowEvent 列表 + TODO
+//! - WRITE/UPDATE/DELETE_ROWS_EVENT_V2 已解析
 //! - 列名固定为 `c0`, `c1`, ... (binlog 流不含列名, 需外部 transform 映射)
 //! - 假定 binlog_row_image=FULL (binlog 含所有列, used_bitmap 全 1)
 //! - column_metadata 暂不解析 (后续支持 VARCHAR>255/CHAR 时按类型步进)
@@ -144,7 +145,7 @@ pub const Parser = struct {
     /// - TABLE_MAP → .table_map (内部缓存 + 副本返回)
     /// - WRITE_ROWS_V2 → .row (RowEvent 切片)
     /// - DELETE_ROWS_V2 → .row (before image 填充到 before_fields)
-    /// - UPDATE_ROWS_V2 → .row (空切片 + TODO)
+    /// - UPDATE_ROWS_V2 → .row (before/after 双镜像)
     /// - 其它 → .unknown (原始 header)
     pub fn processEvent(self: *Parser, buffer: []const u8) ParseError!ParsedEvent {
         const header = try parseHeader(buffer);
@@ -164,12 +165,7 @@ pub const Parser = struct {
             .table_map => try self.processTableMap(body),
             .write_rows_v2 => try self.parseWriteRows(header, body),
             .delete_rows_v2 => try self.parseDeleteRows(header, body),
-            // TODO: UPDATE_ROWS_EVENT 解析 (后续 Task).
-            // 实现 UPDATE 时需注意: UPDATE_ROWS_EVENT_V2 在 used_bitmap 之后
-            // 多一个 columns_used_for_update_bitmap (用于 binlog_row_image=FULL 模式).
-            .update_rows_v2 => blk: {
-                break :blk ParsedEvent{ .row = &.{} };
-            },
+            .update_rows_v2 => try self.parseUpdateRows(header, body),
             else => ParsedEvent{ .unknown = header },
         };
     }
@@ -192,16 +188,22 @@ pub const Parser = struct {
         table_id: u64,
         tm: TableMap,
         col_count: usize,
+        used_bitmap: []const u8,
         used_columns: []usize,
         num_rows: usize,
         pos: usize,
+        update_bitmap: ?[]const u8 = null,
     };
 
     /// 解析 WRITE/UPDATE/DELETE_ROWS_EVENT_V2 的公共前导部分:
     /// post-header (table_id + flags + extra_data_len) → table map 查询 →
-    /// col_count → used_bitmap → used_columns → num_rows.
+    /// col_count → used_bitmap → (UPDATE 时 update_bitmap) → used_columns → num_rows.
     /// 返回的 `used_columns` 由调用方负责释放; `tm` 为 Parser 内部缓存, 只读不可长期持有。
-    fn parseRowsEventHeader(self: *Parser, body: []const u8) ParseError!RowsEventHeader {
+    fn parseRowsEventHeader(
+        self: *Parser,
+        body: []const u8,
+        has_update_bitmap: bool,
+    ) ParseError!RowsEventHeader {
         var pos: usize = 0;
 
         // post-header (V2): table_id (6) + flags (2) + extra_data_length (2)
@@ -233,6 +235,14 @@ pub const Parser = struct {
         const used_bitmap = body[pos..][0..used_bitmap_len];
         pos += used_bitmap_len;
 
+        // UPDATE_ROWS_EVENT_V2 在 used_bitmap 之后多一个 columns_used_for_update_bitmap
+        var update_bitmap: ?[]const u8 = null;
+        if (has_update_bitmap) {
+            if (body.len < pos + used_bitmap_len) return error.BufferTooShort;
+            update_bitmap = body[pos..][0..used_bitmap_len];
+            pos += used_bitmap_len;
+        }
+
         // 收集 used column 索引 (按列号升序)
         var used_columns = std.ArrayList(usize).empty;
         errdefer used_columns.deinit(self.allocator);
@@ -251,14 +261,16 @@ pub const Parser = struct {
             .table_id = table_id,
             .tm = tm,
             .col_count = col_count,
+            .used_bitmap = used_bitmap,
             .used_columns = try used_columns.toOwnedSlice(self.allocator),
             .num_rows = num_rows,
             .pos = pos,
+            .update_bitmap = update_bitmap,
         };
     }
 
     fn parseWriteRows(self: *Parser, header: EventHeader, body: []const u8) ParseError!ParsedEvent {
-        const reh = try self.parseRowsEventHeader(body);
+        const reh = try self.parseRowsEventHeader(body, false);
         defer self.allocator.free(reh.used_columns);
 
         const tm = reh.tm;
@@ -288,7 +300,7 @@ pub const Parser = struct {
     }
 
     fn parseDeleteRows(self: *Parser, header: EventHeader, body: []const u8) ParseError!ParsedEvent {
-        const reh = try self.parseRowsEventHeader(body);
+        const reh = try self.parseRowsEventHeader(body, false);
         defer self.allocator.free(reh.used_columns);
 
         const tm = reh.tm;
@@ -313,6 +325,46 @@ pub const Parser = struct {
 
             // DELETE 仅含 before image, 填充到 before_fields; fields 保持为空.
             try self.readRowInto(&row.before_fields.?, tm, reh.used_columns, body, &pos);
+            try rows.append(self.allocator, row);
+        }
+
+        return ParsedEvent{ .row = try rows.toOwnedSlice(self.allocator) };
+    }
+
+    fn parseUpdateRows(self: *Parser, header: EventHeader, body: []const u8) ParseError!ParsedEvent {
+        const rh = try self.parseRowsEventHeader(body, true);
+        defer self.allocator.free(rh.used_columns);
+
+        // For FULL row image, update_bitmap should match used_bitmap.
+        if (rh.update_bitmap) |ub| {
+            if (!std.mem.eql(u8, rh.used_bitmap, ub)) {
+                return error.InvalidEvent;
+            }
+        }
+
+        const tm = rh.tm;
+        var pos = rh.pos;
+
+        var rows = std.ArrayList(event_mod.RowEvent).empty;
+        errdefer {
+            for (rows.items) |*r| r.deinit(self.allocator);
+            rows.deinit(self.allocator);
+        }
+
+        for (0..rh.num_rows) |_| {
+            var row = event_mod.RowEvent{
+                .op = .update,
+                .table = try self.allocator.dupe(u8, tm.table),
+                .database = try self.allocator.dupe(u8, tm.database),
+                .fields = std.StringHashMap([]const u8).init(self.allocator),
+                .timestamp = @as(i64, header.timestamp),
+            };
+            errdefer row.deinit(self.allocator);
+
+            row.before_fields = std.StringHashMap([]const u8).init(self.allocator);
+            try self.readRowInto(&row.before_fields.?, tm, rh.used_columns, body, &pos);
+            try self.readRowInto(&row.fields, tm, rh.used_columns, body, &pos);
+
             try rows.append(self.allocator, row);
         }
 
@@ -842,24 +894,87 @@ test "Parser WRITE_ROWS_V2 returns empty for unknown table_id" {
     try std.testing.expectError(error.UnknownTableId, p.processEvent(&wr_buf));
 }
 
-test "Parser UPDATE_ROWS_V2 returns empty row slice with TODO" {
+test "Parser parses UPDATE_ROWS_V2 with before and after images" {
     const a = std.testing.allocator;
     var p = Parser.init(a);
     defer p.deinit();
 
-    // UPDATE_ROWS_V2 空事件: header(19) + crc(4) = 23
-    var buf: [23]u8 = undefined;
-    @memset(&buf, 0);
-    std.mem.writeInt(u32, buf[0..4], 0, .little);
-    buf[4] = 0x1f; // UPDATE_ROWS_V2
-    std.mem.writeInt(u32, buf[5..9], 1, .little);
-    std.mem.writeInt(u32, buf[9..13], 23, .little);
-    std.mem.writeInt(u32, buf[13..17], 0, .little);
-    std.mem.writeInt(u16, buf[17..19], 0, .little);
-    // bytes 19..22 为 CRC (已清零)
-    const ev = try p.processEvent(&buf);
+    // TABLE_MAP: 2 cols [TINYINT, VARCHAR], db="db", tbl="t", body=18, event_size=41
+    var tm_buf: [80]u8 = undefined;
+    @memset(&tm_buf, 0);
+    std.mem.writeInt(u32, tm_buf[0..4], 0, .little);
+    tm_buf[4] = 0x13;
+    std.mem.writeInt(u32, tm_buf[5..9], 1, .little);
+    std.mem.writeInt(u32, tm_buf[9..13], 41, .little);
+    std.mem.writeInt(u32, tm_buf[13..17], 0, .little);
+    std.mem.writeInt(u16, tm_buf[17..19], 0, .little);
+    var tpos: usize = 19;
+    std.mem.writeInt(u48, tm_buf[tpos..][0..6], 0x42, .little);
+    tpos += 6;
+    tm_buf[tpos] = 2;
+    tpos += 1;
+    @memcpy(tm_buf[tpos..][0..2], "db");
+    tpos += 2;
+    tm_buf[tpos] = 0;
+    tpos += 1;
+    tm_buf[tpos] = 1;
+    tpos += 1;
+    @memcpy(tm_buf[tpos..][0..1], "t");
+    tpos += 1;
+    tm_buf[tpos] = 0;
+    tpos += 1;
+    tm_buf[tpos] = 2;
+    tpos += 1;
+    tm_buf[tpos] = 0x01;
+    tpos += 1;
+    tm_buf[tpos] = 0x0f;
+    tpos += 1;
+    tm_buf[tpos] = 0;
+    tpos += 1;
+    tm_buf[tpos] = 0;
+    tpos += 1;
+    _ = try p.processEvent(&tm_buf);
+
+    // UPDATE_ROWS_V2 layout:
+    // post-header(10) + col_count(1) + used_bitmap(1) + update_bitmap(1) +
+    // num_rows(1) + before_null_bitmap(1) + before_values(TINYINT=1, VARCHAR=1+1) +
+    // after_null_bitmap(1) + after_values(TINYINT=1, VARCHAR=1+1) = 22
+    // event_size = 19 + 22 + 4 = 45
+    var upd_buf: [80]u8 = undefined;
+    @memset(&upd_buf, 0);
+    std.mem.writeInt(u32, upd_buf[0..4], 0, .little);
+    upd_buf[4] = 0x1f; // UPDATE_ROWS_V2
+    std.mem.writeInt(u32, upd_buf[5..9], 1, .little);
+    std.mem.writeInt(u32, upd_buf[9..13], 45, .little);
+    std.mem.writeInt(u32, upd_buf[13..17], 0, .little);
+    std.mem.writeInt(u16, upd_buf[17..19], 0, .little);
+    std.mem.writeInt(u48, upd_buf[19..25], 0x42, .little);
+    upd_buf[29] = 2; // col_count
+    upd_buf[30] = 0x03; // used_bitmap: cols 0,1 used
+    upd_buf[31] = 0x03; // update_bitmap: cols 0,1 used for update
+    upd_buf[32] = 1; // num_rows
+    // before image: id=5, name="a"
+    upd_buf[33] = 0x00; // before null_bitmap
+    upd_buf[34] = 5; // id
+    upd_buf[35] = 1; // varchar len
+    @memcpy(upd_buf[36..][0..1], "a");
+    // after image: id=5, name="b"
+    upd_buf[37] = 0x00; // after null_bitmap
+    upd_buf[38] = 5; // id
+    upd_buf[39] = 1; // varchar len
+    @memcpy(upd_buf[40..][0..1], "b");
+
+    var ev = try p.processEvent(&upd_buf);
+    defer freeRowEvents(a, ev.row);
+
     try std.testing.expect(ev == .row);
-    try std.testing.expectEqual(@as(usize, 0), ev.row.len);
+    try std.testing.expectEqual(@as(usize, 1), ev.row.len);
+    const row = &ev.row[0];
+    try std.testing.expectEqual(event_mod.RowOp.update, row.op);
+    try std.testing.expectEqualStrings("5", row.getBeforeField("c0").?);
+    try std.testing.expectEqualStrings("a", row.getBeforeField("c1").?);
+    try std.testing.expectEqualStrings("5", row.getField("c0").?);
+    try std.testing.expectEqualStrings("b", row.getField("c1").?);
 }
 
 test "readPackedInt handles 1 / 3 / 4 / 9 byte encodings" {
