@@ -28,6 +28,7 @@
 const std = @import("std");
 const event_mod = @import("../event.zig");
 const position_mod = @import("position.zig");
+const decoder = @import("decoder.zig");
 
 pub const EventType = enum(u8) {
     rotate = 0x04,
@@ -67,6 +68,25 @@ pub const TableMap = struct {
         allocator.free(self.column_metadata);
         allocator.free(self.null_bitmap);
         self.* = undefined;
+    }
+
+    /// 返回指定 MySQL 列类型在 column_metadata 中占用的字节数.
+    /// 委托给 decoder 模块, 保持 metadata 解析逻辑集中.
+    pub fn metadataLengthForType(col_type: u8) usize {
+        return decoder.metadataLengthForType(col_type);
+    }
+
+    /// 返回 column `col_idx` 在 column_metadata 中对应的切片.
+    /// 通过累加前面所有列的 metadata 长度计算偏移, 然后按本列长度切片.
+    /// 调用方应保证 `col_idx < self.column_types.len` 且
+    /// `column_metadata` 总长与各列 metadata 长度之和一致 (由 parseTableMap 保证).
+    pub fn metadataForColumn(self: TableMap, col_idx: usize) []const u8 {
+        var offset: usize = 0;
+        for (self.column_types[0..col_idx]) |t| {
+            offset += decoder.metadataLengthForType(t);
+        }
+        const len = decoder.metadataLengthForType(self.column_types[col_idx]);
+        return self.column_metadata[offset..][0..len];
     }
 };
 
@@ -1136,4 +1156,20 @@ test "processEvent strips 4-byte binlog checksum from WRITE_ROWS_V2" {
     try std.testing.expect(ev == .row);
     try std.testing.expectEqual(@as(usize, 1), ev.row.len);
     try std.testing.expectEqualStrings("42", ev.row[0].getField("c0").?);
+}
+
+test "TableMap.metadataForColumn returns correct per-column slice" {
+    // types: [TINYINT=0x01, VARCHAR=0x0f, INT24=0x09]
+    // metadata: ["", "\x00\x05" (VARCHAR max_length=5), ""]
+    const tm = TableMap{
+        .table_id = 0,
+        .database = "",
+        .table = "",
+        .column_types = &.{ 0x01, 0x0f, 0x09 },
+        .column_metadata = "\x00\x05",
+        .null_bitmap = "",
+    };
+    try std.testing.expectEqualStrings("", tm.metadataForColumn(0));
+    try std.testing.expectEqualStrings("\x00\x05", tm.metadataForColumn(1));
+    try std.testing.expectEqualStrings("", tm.metadataForColumn(2));
 }
