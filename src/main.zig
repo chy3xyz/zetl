@@ -21,9 +21,12 @@ pub fn main(init: std.process.Init) !void {
     zfinal.io_instance.init(init);
     const allocator = init.gpa;
 
-    // 0. P1 任务 1.8: 优雅停机 - 注册 SIGINT/SIGTERM handler
-    //    zfinal.shutdown 用 atomic flag 置位, server.acceptLoop 在下个循环迭代时退出
-    zfinal.shutdown.registerHandlers();
+    // 0. P1 任务 1.8: 优雅停机 — 已通过 zfinal.shutdown.registerHandlers() 注册
+    //    SIGINT/SIGTERM handler, 置位 atomic flag, server.acceptLoop 下个迭代时退出
+    //    临时禁用: zfinal v0.10.6 server.zig:111 的 group.cancel(io) 在 group 仍有
+    //    awaiter 时会触发 assert(!pre_cancel_status.have_awaiter) panic, 导致进程
+    //    崩溃. 等待 zfinal 修复后再启用.
+    // zfinal.shutdown.registerHandlers();
 
     // 1. 加载配置
     var cfg = try config_mod.loadConfig(allocator, "config.toml");

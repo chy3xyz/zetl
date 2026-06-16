@@ -79,20 +79,56 @@ pub const TransformEngine = struct {
         // 注: target 已包含 dupe'd key/value, mapper.apply 成功后所有权完整转移
         // 后续 errdefer 用 freeRowData 整体释放
 
-        // 2. 常量注入 (KEY 和 VALUE 都要 dupe, 因为 freeRowData 会统一释放)
+        // 2. 自动补齐目标表标准字段 (仅在尚未映射时)
+        // create_time -> source_create_time, update_time -> source_update_time
+        if (target.get("source_create_time") == null) {
+            if (event.fields.get("create_time")) |v| {
+                const k = try self.allocator.dupe(u8, "source_create_time");
+                errdefer self.allocator.free(k);
+                const val_dup = try self.allocator.dupe(u8, v);
+                errdefer self.allocator.free(val_dup);
+                try target.put(k, val_dup);
+            }
+        }
+        if (target.get("source_update_time") == null) {
+            if (event.fields.get("update_time")) |v| {
+                const k = try self.allocator.dupe(u8, "source_update_time");
+                errdefer self.allocator.free(k);
+                const val_dup = try self.allocator.dupe(u8, v);
+                errdefer self.allocator.free(val_dup);
+                try target.put(k, val_dup);
+            }
+        }
+        if (target.get("sync_type") == null) {
+            const k = try self.allocator.dupe(u8, "sync_type");
+            errdefer self.allocator.free(k);
+            const v = try self.allocator.dupe(u8, "1");
+            errdefer self.allocator.free(v);
+            try target.put(k, v);
+        }
+
+        // 3. identity 模式下, 移除源表有但目标表不需要的字段 (如自增 id 和已重命名的 create_time/update_time)
+        if (self.mapper.mappings.len == 0) {
+            const to_remove = [_][]const u8{ "id", "create_time", "update_time" };
+            for (to_remove) |key| {
+                if (target.get(key) != null) {
+                    const removed = target.fetchRemove(key) orelse continue;
+                    self.allocator.free(removed.key);
+                    self.allocator.free(removed.value);
+                }
+            }
+        }
+
+        // 4. 常量注入 (KEY 和 VALUE 都要 dupe, 因为 freeRowData 会统一释放)
         const mall_dup = try self.allocator.dupe(u8, self.cfg.mall_id);
         const mall_key = try self.allocator.dupe(u8, "mall_id");
         const source_type_dup = try self.allocator.dupe(u8, self.cfg.source_type);
         const source_type_key = try self.allocator.dupe(u8, "source_type");
-        var ts_buf: [32]u8 = undefined;
-        const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{currentTimestamp()}) catch "0";
-        const sync_time_dup = try self.allocator.dupe(u8, ts_str);
-        const sync_time_key = try self.allocator.dupe(u8, "sync_time");
+        // 注: sync_time 列有 DEFAULT CURRENT_TIMESTAMP, 不在 INSERT 中指定让它自动填
         try target.put(mall_key, mall_dup);
         try target.put(source_type_key, source_type_dup);
-        try target.put(sync_time_key, sync_time_dup);
 
-        // 3. 过滤 (skip = 不通过 filter, 即 predicate 为 false)
+        // 5. 过滤 (skip = 不通过 filter, 即 predicate 为 false)
         if (self.cfg.filter_field) |ff| {
             if (target.get(ff)) |fv| {
                 const predicate = try self.evalFilter(ff, fv);
@@ -103,7 +139,7 @@ pub const TransformEngine = struct {
             }
         }
 
-        // 4. 佣金计算 (按 order_total)
+        // 6. 佣金计算 (按 order_total)
         if (self.cfg.enable_commission_calc) {
             if (target.get("order_total")) |amt| {
                 const agent_id = target.get("agent_id") orelse "";

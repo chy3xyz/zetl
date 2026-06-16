@@ -82,7 +82,9 @@ pub const Mapper = struct {
         return Mapper{ .allocator = allocator, .mappings = try list.toOwnedSlice(allocator) };
     }
 
-    /// 把源行 map 成目标行 (caller 负责 free)
+    /// 把源行 map 成目标行 (caller 负责 free).
+    /// 当 mappings 为空时, 默认做 identity 映射 (源字段名直接作为目标字段名),
+    /// 避免 field_mappings 未配置时 target 为空导致 sink INSERT 缺少必填列.
     pub fn apply(self: *Mapper, source: std.StringHashMap([]const u8)) !std.StringHashMap([]const u8) {
         var target = std.StringHashMap([]const u8).init(self.allocator);
         errdefer {
@@ -93,6 +95,20 @@ pub const Mapper = struct {
             }
             target.deinit();
         }
+
+        if (self.mappings.len == 0) {
+            // identity 模式: 直接遍历 source 字段
+            var it = source.iterator();
+            while (it.next()) |e| {
+                const key_dup = try self.allocator.dupe(u8, e.key_ptr.*);
+                errdefer self.allocator.free(key_dup);
+                const val_dup = try self.allocator.dupe(u8, e.value_ptr.*);
+                errdefer self.allocator.free(val_dup);
+                try target.put(key_dup, val_dup);
+            }
+            return target;
+        }
+
         for (self.mappings) |m| {
             const val = source.get(m.source) orelse m.default_value orelse continue;
             const key_dup = try self.allocator.dupe(u8, m.target);

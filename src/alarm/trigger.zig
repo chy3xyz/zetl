@@ -227,8 +227,9 @@ test "trigger.cooldown: same alarm within 5min is suppressed" {
     defer store.deinit();
     defer resetCooldown(a);
 
-    // 配 1 个 enabled 规则 (URL 用 127.0.0.1:1 立即 connection refused, 不挂线程)
-    _ = try rule_mod.insert(&store, "delay_alert", "{}", "http://127.0.0.1:1/hook");
+    // 配 1 个 enabled 规则, URL 留空避免真实 HTTP 请求/报错; 第一次触发会 warn 跳过,
+    // 第二次因 cooldown 不会走到 webhook 发送路径.
+    _ = try rule_mod.insert(&store, "delay_alert", "{}", "");
     checkDelay(a, &store, 99, "task_x", 90);
     // 紧接着再触发一次, 内部 cooldown 应阻止 webhook 发送
     checkDelay(a, &store, 99, "task_x", 90);
