@@ -6,13 +6,15 @@ const store_mod = @import("store.zig");
 
 pub const SyncMode = enum {
     full,
-    cdc,
+    poll,
+    binlog,
     both,
 
     pub fn toString(s: SyncMode) []const u8 {
         return switch (s) {
             .full => "full",
-            .cdc => "cdc",
+            .poll => "poll",
+            .binlog => "binlog",
             .both => "both",
         };
     }

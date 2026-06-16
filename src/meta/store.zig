@@ -20,7 +20,23 @@ pub const MetaStore = struct {
         self.db.deinit();
     }
 
-    fn createAllTables(self: *MetaStore) !void {
+    fn migrateSyncPosition(self: *MetaStore) !void {
+        var info = try self.db.query("PRAGMA table_info(sync_position)");
+        defer info.deinit();
+        var has_file = false;
+        var has_pos = false;
+        while (info.next()) {
+            if (info.getCurrentRowMap()) |row| {
+                const name = row.get("name") orelse continue;
+                if (std.mem.eql(u8, name, "binlog_file")) has_file = true;
+                if (std.mem.eql(u8, name, "binlog_pos")) has_pos = true;
+            }
+        }
+        if (!has_file) try self.db.exec("ALTER TABLE sync_position ADD COLUMN binlog_file TEXT NOT NULL DEFAULT ''");
+        if (!has_pos) try self.db.exec("ALTER TABLE sync_position ADD COLUMN binlog_pos INTEGER NOT NULL DEFAULT 0");
+    }
+
+    pub fn createAllTables(self: *MetaStore) !void {
         // 数据源
         try self.db.exec(
             \\CREATE TABLE IF NOT EXISTS datasource (
@@ -60,7 +76,7 @@ pub const MetaStore = struct {
             \\)
         );
 
-        // 位点 (伪 CDC: last_pk 全量游标 + last_update_time 增量游标)
+        // 位点 (伪 CDC: last_pk 全量游标 + last_update_time 增量游标; binlog CDC: binlog_file + binlog_pos)
         try self.db.exec(
             \\CREATE TABLE IF NOT EXISTS sync_position (
             \\  task_id INTEGER PRIMARY KEY,
@@ -69,9 +85,12 @@ pub const MetaStore = struct {
             \\  last_event_time TEXT,
             \\  stage TEXT NOT NULL DEFAULT 'full',
             \\  updated_at TEXT DEFAULT (datetime('now')),
+            \\  binlog_file TEXT NOT NULL DEFAULT '',
+            \\  binlog_pos INTEGER NOT NULL DEFAULT 0,
             \\  FOREIGN KEY (task_id) REFERENCES sync_task(id)
             \\)
         );
+        try self.migrateSyncPosition();
 
         // 运行时指标
         try self.db.exec(

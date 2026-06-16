@@ -90,7 +90,12 @@ pub const Scheduler = struct {
         const t2 = Scheduler.nowMs();
 
         // 3. 构造 SyncTask
-        const sync_mode = std.meta.stringToEnum(meta.task.SyncMode, task.sync_mode) orelse .cdc;
+        // 旧 sync_mode='cdc' 视作增量轮询 (.poll) — 老 CDC 实现本质就是按 update_time 轮询
+        const sync_mode = blk: {
+            const raw = task.sync_mode;
+            if (std.mem.eql(u8, raw, "cdc")) break :blk .poll;
+            break :blk std.meta.stringToEnum(meta.task.SyncMode, raw) orelse .poll;
+        };
         const rcfg = runtime.RuntimeConfig{
             .task_id = task.id,
             .source_table = task.source_table,

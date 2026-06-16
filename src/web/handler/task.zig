@@ -15,7 +15,7 @@ pub fn create(ctx: *zfinal.Context) !void {
         datasource_id: i64,
         source_table: []const u8,
         target_table: []const u8,
-        sync_mode: []const u8 = "both",
+        sync_mode: []const u8 = "poll",
         field_mappings: ?[]const u8 = null,
         filter_condition: ?[]const u8 = null,
         batch_size: i32 = 1000,
@@ -32,7 +32,22 @@ pub fn create(ctx: *zfinal.Context) !void {
         return;
     }
 
-    const sync_mode = std.meta.stringToEnum(meta.task.SyncMode, v.sync_mode) orelse .cdc;
+    // sync_mode 校验与历史映射:
+    //   - 缺省/未提供 -> poll (use JSON default above)
+    //   - "cdc"       -> poll (legacy 字段名)
+    //   - 其他合法值   -> full | poll | binlog | both
+    //   - 非法值      -> 400, 列出所有合法选项
+    const sync_mode = blk: {
+        const raw = v.sync_mode;
+        if (std.mem.eql(u8, raw, "cdc")) break :blk meta.task.SyncMode.poll;
+        if (std.meta.stringToEnum(meta.task.SyncMode, raw)) |mode| break :blk mode;
+        try response.fail(
+            ctx,
+            .param_error,
+            "sync_mode 非法, 合法值: full / poll / binlog / both (cdc 已弃用, 等同 poll)",
+        );
+        return;
+    };
     const id = meta.task.Service.insert(deps.store_ptr, .{
         .task_name = v.task_name,
         .datasource_id = v.datasource_id,

@@ -17,6 +17,13 @@ pub const RuntimeConfig = struct {
     incremental_poll_ms: u64 = 1000, mall_id: []const u8 = "",
 };
 
+/// binlog 启动位点 (file + pos). pos 为 i64 与 SyncPosition.binlog_pos 对齐;
+/// 调用 BinlogReader.open 时需 @intCast 到 u64.
+pub const BinlogStartPos = struct {
+    file: []const u8,
+    pos: i64,
+};
+
 pub const SyncTask = struct {
     allocator: std.mem.Allocator, cfg: RuntimeConfig,
     transformer: transform.engine.TransformEngine, sink: sink_mod.mysql_sink.MySqlSink,
@@ -24,6 +31,8 @@ pub const SyncTask = struct {
     src_pool: *zfinal.ConnectionPool,
     poller: cdc.poller.Poller,
     _sh: []u8, _sd: []u8, _su: []u8, _sp: []u8, // 持有 src DBConfig 的 dupe'd 字符串
+    /// binlog CDC 用的源库 DB 连接 (P2 Task 11 注入, 当前为 null).
+    binlog_db: ?zfinal.DB = null,
     is_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// runLoop 退出后置 true, 供 stopAll 提前结束等待.
     is_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -49,14 +58,31 @@ pub const SyncTask = struct {
         const po = try meta.position.Service.load(store, a, cfg.task_id);
         const pl_cfg = cdc.poller.PollerConfig.fromSlices(src_host, ds.port, src_user, src_pass, src_db, cfg.source_table, cfg.pk_column, cfg.update_time_column, @intCast(cfg.batch_size));
         const pl = cdc.poller.Poller.init(a, pl_cfg, src_pool);
+        // P2 Task 11: 专用 binlog 连接 (与 src_pool 独立, 避免 binlong dump 阻塞 poll 查询).
+        // 复用 src_host/_db/_user/_pass (堆分配, 由 _sh/_sd/_su/_sp 持有寿命).
+        // MySQL driver 在 connect 内部已 bufPrint 到栈, 不持有外部字符串引用, 故字符串寿命
+        // 仅需覆盖到 binlog_db.deinit().
+        const binlog_cfg = zfinal.DBConfig{
+            .db_type = .mysql,
+            .host = src_host,
+            .port = ds.port,
+            .database = src_db,
+            .username = src_user,
+            .password = src_pass,
+        };
+        const binlog_db = try zfinal.DB.init(a, binlog_cfg);
+        errdefer binlog_db.deinit();
         return .{.allocator=a,.cfg=cfg,.transformer=tr,.sink=sk,.store=store,.sink_pool=sp,.src_pool=src_pool,.poller=pl,
-            ._sh=src_host,._sd=src_db,._su=src_user,._sp=src_pass,.pos=po};
+            ._sh=src_host,._sd=src_db,._su=src_user,._sp=src_pass,.pos=po,.binlog_db=binlog_db};
     }
 
     pub fn deinit(self: *SyncTask) void {
         self.transformer.deinit(); self.sink.deinit();
         // src_pool 由 ConnectionPool.init 在内部 self-destroy, 外部只需 deinit.
         self.src_pool.deinit();
+        // binlog_db 必须在 _sh/_sd/_su/_sp 释放前 deinit — MySQL driver 不持有外部字符串引用,
+        // 但顺序上保持 deinit 早于堆字符串释放更安全 (后续若 driver 变化).
+        if (self.binlog_db) |*bd| bd.deinit();
         self.allocator.free(self._sh); self.allocator.free(self._sd);
         self.allocator.free(self._su); self.allocator.free(self._sp);
         self.pos.deinit(self.allocator);
@@ -95,11 +121,28 @@ pub const SyncTask = struct {
             };
         }
 
-        // 2. 增量阶段 (sync_mode=cdc/both)
-        if (self.is_running.load(.acquire) and (self.cfg.sync_mode == .cdc or self.cfg.sync_mode == .both)) {
-            self.runIncremental() catch |err| {
-                common.logger.err_("[task {d}] 增量: {s}", .{self.cfg.task_id,@errorName(err)}); self.markError(@errorName(err));
-            };
+        // 2. 增量阶段 (按 sync_mode 分发)
+        if (!self.is_running.load(.acquire)) return;
+
+        // 增量阶段
+        switch (self.cfg.sync_mode) {
+            .full => return,
+            .poll => self.runIncremental() catch |err| {
+                common.logger.err_("[task {d}] 增量轮询: {s}", .{self.cfg.task_id, @errorName(err)});
+                self.markError(@errorName(err));
+            },
+            .binlog, .both => {
+                if (self.pos.stage != .binlog) {
+                    self.pos.stage = .binlog;
+                    self.savePosition() catch |err| {
+                        common.logger.warn("[task {d}] stage→binlog savePosition: {s}", .{self.cfg.task_id, @errorName(err)});
+                    };
+                }
+                self.runBinlogIncremental() catch |err| {
+                    common.logger.err_("[task {d}] binlog: {s}", .{self.cfg.task_id, @errorName(err)});
+                    self.markError(@errorName(err));
+                };
+            },
         }
     }
 
@@ -157,6 +200,103 @@ pub const SyncTask = struct {
             }
             sleepMs(self.cfg.incremental_poll_ms);
         }
+    }
+
+    /// binlog CDC 增量同步 (P2 Task 11).
+    ///
+    /// 流程:
+    ///   1. 取 binlog_db (Task 11 注入的专用 MySQL 连接) 的指针;
+    ///   2. 启动位点优先用持久化的 binlog_file/binlog_pos, 否则 SHOW MASTER STATUS 取当前位点;
+    ///   3. 循环: reader.nextEvent → parser.processEvent → 分发 (rotate / heartbeat / row / table_map / unknown);
+    ///   4. 每轮末尾用 reader.currentPosition 更新 self.pos 并 savePosition 持久化.
+    fn runBinlogIncremental(self: *SyncTask) !void {
+        const bd = if (self.binlog_db) |*p| p else return error.NoBinlogDb;
+        common.logger.inf("[task {d}] 启动 binlog CDC", .{self.cfg.task_id});
+
+        var reader = cdc.binlog.BinlogReader.init(self.allocator, bd);
+        defer reader.deinit();
+
+        // 启动位点: 优先使用持久化的 binlog_file/binlog_pos, 否则 SHOW MASTER STATUS.
+        const start_pos: BinlogStartPos = if (self.pos.binlog_file.len > 0)
+            .{ .file = self.pos.binlog_file, .pos = self.pos.binlog_pos }
+        else
+            try self.queryMasterStatus();
+
+        // start_pos.pos 是 i64 (SyncPosition.binlog_pos 类型); reader.open 需要 u64.
+        try reader.open(start_pos.file, @intCast(start_pos.pos));
+
+        var parser = cdc.binlog.parser.Parser.init(self.allocator);
+        defer parser.deinit();
+
+        while (self.is_running.load(.acquire)) {
+            const raw = reader.nextEvent() catch |err| {
+                common.logger.err_("[task {d}] binlog fetch: {s}", .{ self.cfg.task_id, @errorName(err) });
+                sleepMs(1000);
+                continue;
+            } orelse continue;
+
+            // raw.buffer 是 C 指针, 指向 mysql client 内部 buffer — 必须在下一轮 nextEvent 前拷出.
+            const buf = try self.allocator.dupe(u8, raw.buffer[0..raw.size]);
+            defer self.allocator.free(buf);
+
+            const parsed = parser.processEvent(buf) catch |err| {
+                common.logger.err_("[task {d}] binlog parse: {s}", .{ self.cfg.task_id, @errorName(err) });
+                continue;
+            };
+
+            switch (parsed) {
+                .rotate => |pos_c| {
+                    // union payload 按值捕获, 是 const; deinit 需要 *Position (可变),
+                    // 拷到 var 上 deinit. 反正 rotate 不再复用 pos.
+                    var pos = pos_c;
+                    defer pos.deinit(self.allocator);
+                    self.allocator.free(self.pos.binlog_file);
+                    self.pos.binlog_file = try self.allocator.dupe(u8, pos.file orelse "");
+                    // pos.pos 是 u64 (Position 类型), binlog_pos 是 i64, 需要显式 cast.
+                    self.pos.binlog_pos = @intCast(pos.pos);
+                },
+                .heartbeat => {},
+                .row => |rows| {
+                    defer cdc.binlog.parser.freeRowEvents(self.allocator, rows);
+                    try self.processBatch(rows, .insert);
+                },
+                .table_map => {},
+                .unknown => {},
+            }
+
+            // 保存当前位点 (rotate 后会再覆盖一次, 但当前 reader.current_pos 还停在 rotate 事件之后).
+            const cur = reader.currentPosition() catch null;
+            if (cur) |p_c| {
+                // currentPosition 返回 by-value, 同样是 const; 拷到 var 上 deinit.
+                var p = p_c;
+                defer p.deinit(self.allocator);
+                self.allocator.free(self.pos.binlog_file);
+                self.pos.binlog_file = try self.allocator.dupe(u8, p.file orelse "");
+                // p.pos 是 u64 (Position 类型), binlog_pos 是 i64.
+                self.pos.binlog_pos = @intCast(p.pos);
+                self.savePosition() catch |err| {
+                    common.logger.warn("[task {d}] savePosition: {s}", .{ self.cfg.task_id, @errorName(err) });
+                };
+            }
+        }
+    }
+
+    /// 从 src_pool 拿一个连接跑 SHOW MASTER STATUS, 返回当前 binlog 位点.
+    /// 启动位点无持久化值时调用. file 由 allocator.dupe, 调用方负责释放 (start_pos 借用, 不 free).
+    fn queryMasterStatus(self: *SyncTask) !BinlogStartPos {
+        const conn = try self.src_pool.acquire();
+        defer self.src_pool.release(conn) catch {};
+        var result = try conn.query("SHOW MASTER STATUS");
+        defer result.deinit();
+        if (result.next()) {
+            if (result.getCurrentRowMap()) |row| {
+                const file = row.get("File") orelse return error.MissingMasterStatus;
+                const pos_s = row.get("Position") orelse return error.MissingMasterStatus;
+                const pos = try std.fmt.parseInt(i64, pos_s, 10);
+                return .{ .file = try self.allocator.dupe(u8, file), .pos = pos };
+            }
+        }
+        return error.MissingMasterStatus;
     }
 
     fn savePosition(self: *SyncTask) !void {
