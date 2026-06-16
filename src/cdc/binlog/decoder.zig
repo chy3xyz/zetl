@@ -53,6 +53,7 @@ pub fn decodeColumn(
         0x03 => decodeInt(allocator, 4, body, pos),
         0x08 => decodeInt(allocator, 8, body, pos),
         0x0f => decodeVarchar(allocator, metadata, body, pos),
+        0x0c => decodeDatetime(allocator, body, pos),
         else => return error.UnsupportedType,
     };
 }
@@ -96,6 +97,23 @@ fn decodeVarchar(allocator: std.mem.Allocator, metadata: []const u8, body: []con
         pos.* += str_len;
         return value;
     }
+}
+
+fn decodeDatetime(allocator: std.mem.Allocator, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (body.len < pos.* + 8) return error.BufferTooShort;
+    const v = std.mem.readInt(u64, body[pos.*..][0..8], .little);
+    pos.* += 8;
+    const date_int: u64 = v >> 32;
+    const time_int: u64 = v & 0xffffffff;
+    const year: u64 = @divFloor(date_int, 16 * 32);
+    const rem1: u64 = date_int % (16 * 32);
+    const month: u64 = @divFloor(rem1, 32);
+    const day: u64 = rem1 % 32;
+    const hour: u64 = @divFloor(time_int, 64 * 64);
+    const rem2: u64 = time_int % (64 * 64);
+    const minute: u64 = @divFloor(rem2, 64);
+    const second: u64 = rem2 % 64;
+    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{ year, month, day, hour, minute, second }) catch return error.OutOfMemory;
 }
 
 test "decodeColumn for TINY returns decimal" {
@@ -150,4 +168,18 @@ test "decodeColumn for LONGLONG returns large signed value" {
     const out = try decodeColumn(std.testing.allocator, 0x08, &.{}, &buf, &pos);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("1099511627775", out);
+}
+
+test "decodeColumn for DATETIME reads 8-byte packed date" {
+    var pos: usize = 0;
+    // 2026-06-15 12:34:56 in MySQL DATETIME wire format:
+    // date_int = day + month*32 + year*16*32
+    // time_int = sec + min*64 + hour*64*64
+    var buf: [8]u8 = undefined;
+    const date_int: u64 = 15 + 6 * 32 + 2026 * 16 * 32;
+    const time_int: u64 = 56 + 34 * 64 + 12 * 64 * 64;
+    std.mem.writeInt(u64, &buf, date_int << 32 | time_int, .little);
+    const out = try decodeColumn(std.testing.allocator, 0x0c, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("2026-06-15 12:34:56", out);
 }
