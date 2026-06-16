@@ -1150,3 +1150,116 @@ test "TableMap.metadataForColumn returns correct per-column slice" {
     try std.testing.expectEqualStrings("\x00\x05", tm.metadataForColumn(1));
     try std.testing.expectEqualStrings("", tm.metadataForColumn(2));
 }
+
+test "Parser parses WRITE_ROWS_V2 with DATETIME/DECIMAL/BLOB/JSON columns" {
+    const a = std.testing.allocator;
+    var p = Parser.init(a);
+    defer p.deinit();
+
+    // TABLE_MAP: 4 cols [DATETIME, NEWDECIMAL(3,2), BLOB pack=1, JSON pack=4]
+    //   body = table_id(6) + db_len(1) + "db"(2) + NUL(1) +
+    //          tbl_len(1) + "t"(1) + NUL(1) +
+    //          col_count(1) + col_types(4) +
+    //          meta_len(1) + meta(4) +
+    //          null_bitmap(1)
+    //   = 6+1+2+1+1+1+1+1+4+1+4+1 = 24. event_size = 19 + 24 + 4 = 47.
+    var tm_buf: [80]u8 = undefined;
+    @memset(&tm_buf, 0);
+    std.mem.writeInt(u32, tm_buf[0..4], 0, .little);
+    tm_buf[4] = 0x13; // TABLE_MAP
+    std.mem.writeInt(u32, tm_buf[5..9], 1, .little);
+    std.mem.writeInt(u32, tm_buf[13..17], 0, .little);
+    std.mem.writeInt(u16, tm_buf[17..19], 0, .little);
+    var tpos: usize = 19;
+    std.mem.writeInt(u48, tm_buf[tpos..][0..6], 0x42, .little);
+    tpos += 6;
+    tm_buf[tpos] = 2;
+    tpos += 1; // db_len
+    @memcpy(tm_buf[tpos..][0..2], "db");
+    tpos += 2;
+    tm_buf[tpos] = 0;
+    tpos += 1; // db NUL
+    tm_buf[tpos] = 1;
+    tpos += 1; // tbl_len
+    @memcpy(tm_buf[tpos..][0..1], "t");
+    tpos += 1;
+    tm_buf[tpos] = 0;
+    tpos += 1; // tbl NUL
+    tm_buf[tpos] = 4;
+    tpos += 1; // col_count (packed-int byte)
+    tm_buf[tpos] = 0x0c;
+    tpos += 1; // DATETIME
+    tm_buf[tpos] = 0xf6;
+    tpos += 1; // NEWDECIMAL
+    tm_buf[tpos] = 0xfc;
+    tpos += 1; // BLOB
+    tm_buf[tpos] = 0xf5;
+    tpos += 1; // JSON
+    tm_buf[tpos] = 4;
+    tpos += 1; // meta_len (packed-int byte = 4 bytes of metadata)
+    tm_buf[tpos] = 3;
+    tpos += 1; // NEWDECIMAL precision
+    tm_buf[tpos] = 2;
+    tpos += 1; // NEWDECIMAL scale
+    tm_buf[tpos] = 1;
+    tpos += 1; // BLOB pack_length
+    tm_buf[tpos] = 4;
+    tpos += 1; // JSON pack_length
+    tm_buf[tpos] = 0;
+    tpos += 1; // null_bitmap (4 cols ≤ 8 → 1 byte)
+    std.mem.writeInt(u32, tm_buf[9..13], @intCast(tpos + 4), .little); // +4 for CRC
+    _ = try p.processEvent(&tm_buf);
+
+    // WRITE_ROWS_V2: 1 row, 4 cols.
+    //   body = post-header(10) + col_count(1) + used_bitmap(1) + num_rows(1) +
+    //          null_bitmap(1) +
+    //          DATETIME(8) + DECIMAL(2) + BLOB(1+5) + JSON(4+1)
+    //   = 10 + 4 + 21 = 35. event_size = 19 + 35 + 4 = 58.
+    var wr_buf: [80]u8 = undefined;
+    @memset(&wr_buf, 0);
+    std.mem.writeInt(u32, wr_buf[0..4], 0, .little);
+    wr_buf[4] = 0x1e; // WRITE_ROWS_V2
+    std.mem.writeInt(u32, wr_buf[5..9], 1, .little);
+    std.mem.writeInt(u32, wr_buf[9..13], 58, .little); // event_size
+    std.mem.writeInt(u32, wr_buf[13..17], 0, .little);
+    std.mem.writeInt(u16, wr_buf[17..19], 0, .little);
+    // body
+    std.mem.writeInt(u48, wr_buf[19..25], 0x42, .little); // table_id
+    // flags (2) + extra_data_len (2) 默认 memset 为 0
+    wr_buf[29] = 4; // col_count
+    wr_buf[30] = 0x0f; // used_bitmap: cols 0..3 used
+    wr_buf[31] = 1; // num_rows
+    wr_buf[32] = 0x00; // null_bitmap (no NULL)
+    // DATETIME: 2026-06-15 12:34:56
+    const date_int: u64 = 15 + 6 * 32 + 2026 * 16 * 32;
+    const time_int: u64 = 56 + 34 * 64 + 12 * 64 * 64;
+    std.mem.writeInt(u64, wr_buf[33..41], (date_int << 32) | time_int, .little);
+    // DECIMAL(3,2) = 1.00: byte 0x81 (1 with sign bit), 0x00 (frac=00)
+    wr_buf[41] = 0x81;
+    wr_buf[42] = 0x00;
+    // BLOB pack=1: len=5 + "hello"
+    wr_buf[43] = 5;
+    @memcpy(wr_buf[44..][0..5], "hello");
+    // JSON pack=4: len=1 + "{"
+    wr_buf[49] = 1;
+    wr_buf[50] = 0;
+    wr_buf[51] = 0;
+    wr_buf[52] = 0;
+    wr_buf[53] = '{';
+    // bytes 54..57 为 CRC (已清零)
+
+    var ev = try p.processEvent(&wr_buf);
+    defer freeRowEvents(a, ev.row);
+
+    try std.testing.expect(ev == .row);
+    try std.testing.expectEqual(@as(usize, 1), ev.row.len);
+    const row = &ev.row[0];
+    try std.testing.expectEqual(event_mod.RowOp.insert, row.op);
+    try std.testing.expectEqualStrings("db", row.database);
+    try std.testing.expectEqualStrings("t", row.table);
+    try std.testing.expectEqual(@as(usize, 4), row.fields.count());
+    try std.testing.expectEqualStrings("2026-06-15 12:34:56", row.getField("c0").?);
+    try std.testing.expectEqualStrings("1.00", row.getField("c1").?);
+    try std.testing.expectEqualStrings("hello", row.getField("c2").?);
+    try std.testing.expectEqualStrings("{", row.getField("c3").?);
+}
