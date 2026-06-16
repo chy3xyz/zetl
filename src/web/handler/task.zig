@@ -32,7 +32,11 @@ pub fn create(ctx: *zfinal.Context) !void {
         return;
     }
 
-    const sync_mode = std.meta.stringToEnum(meta.task.SyncMode, v.sync_mode) orelse .cdc;
+    const sync_mode = blk: {
+        const raw = v.sync_mode;
+        if (std.mem.eql(u8, raw, "cdc")) break :blk meta.task.SyncMode.poll;
+        break :blk std.meta.stringToEnum(meta.task.SyncMode, raw) orelse .poll;
+    };
     const id = meta.task.Service.insert(deps.store_ptr, .{
         .task_name = v.task_name,
         .datasource_id = v.datasource_id,

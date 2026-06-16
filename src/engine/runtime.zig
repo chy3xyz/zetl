@@ -95,8 +95,8 @@ pub const SyncTask = struct {
             };
         }
 
-        // 2. 增量阶段 (sync_mode=cdc/both)
-        if (self.is_running.load(.acquire) and (self.cfg.sync_mode == .cdc or self.cfg.sync_mode == .both)) {
+        // 2. 增量阶段 (sync_mode=poll/binlog/both)
+        if (self.is_running.load(.acquire) and (self.cfg.sync_mode == .poll or self.cfg.sync_mode == .binlog or self.cfg.sync_mode == .both)) {
             self.runIncremental() catch |err| {
                 common.logger.err_("[task {d}] 增量: {s}", .{self.cfg.task_id,@errorName(err)}); self.markError(@errorName(err));
             };
