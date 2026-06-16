@@ -58,4 +58,4 @@
 ## 已知限制
 
 - **伪 CDC**: V1/V2 基于 `update_time` 轮询, 非真实 binlog; 物理删除无法感知, 源表需用 `is_delete=1` 软删除才会同步为删除.
-- **优雅停机**: zfinal v0.10.6 `shutdown.registerHandlers()` 会触发 `server.zig:111` panic, 当前已禁用, 需等上游修复.
+- **优雅停机**: ✅ zfinal v0.10.8 已修复; SIGTERM/SIGINT 可在 ~3s 内完成停机, 无 panic, 无泄漏.
