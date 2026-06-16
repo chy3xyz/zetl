@@ -45,6 +45,7 @@ pub const Scheduler = struct {
 
     /// 启动一个任务 (从 task_id 加载配置)
     pub fn startTask(self: *Scheduler, task_id: i64) !void {
+        const t0 = Scheduler.nowMs();
         // P1 任务 1.8: 优雅停机检查 - 收到停机信号后拒绝任何新 task 启动.
         // 双重检查: 快路径 (无锁) + 锁内精确检查.
         if (self.is_shutting_down.load(.acquire)) {
@@ -75,6 +76,7 @@ pub const Scheduler = struct {
             var t = task;
             t.deinit(self.allocator);
         }
+        const t1 = Scheduler.nowMs();
 
         // 2. 加载 datasource
         const ds = (try meta.datasource.Service.findById(self.store, self.allocator, task.datasource_id)) orelse {
@@ -85,6 +87,7 @@ pub const Scheduler = struct {
             var d = ds;
             d.deinit(self.allocator);
         }
+        const t2 = Scheduler.nowMs();
 
         // 3. 构造 SyncTask
         const sync_mode = std.meta.stringToEnum(meta.task.SyncMode, task.sync_mode) orelse .cdc;
@@ -105,18 +108,25 @@ pub const Scheduler = struct {
         const src_user = try self.allocator.dupe(u8, ds.username);
         const src_pass = try self.allocator.dupe(u8, ds.password);
         const src_cfg = zfinal.DBConfig{.db_type=.mysql,.host=src_host,.port=ds.port,.database=src_db,.username=src_user,.password=src_pass};
+        const t3 = Scheduler.nowMs();
         const src_pool = try zfinal.ConnectionPool.init(self.allocator, src_cfg, 1);
+        const t4 = Scheduler.nowMs();
         const task_ptr = try self.allocator.create(runtime.SyncTask);
         errdefer self.allocator.destroy(task_ptr);
         task_ptr.* = try runtime.SyncTask.init(self.allocator, rcfg, ds, self.store, self.sink_pool, src_pool, src_host, src_db, src_user, src_pass);
+        const t5 = Scheduler.nowMs();
 
         // 4. 启动线程
         try task_ptr.start();
+        const t6 = Scheduler.nowMs();
         try self.tasks.put(task_id, task_ptr);
 
         // 5. 更新 task 状态为运行中
         try meta.task.Service.updateStatus(self.store, task_id, 1, null);
-        common.logger.inf("任务 {d} ({s}) 启动成功", .{ task_id, task.task_name });
+        const t7 = Scheduler.nowMs();
+        common.logger.inf("任务 {d} ({s}) 启动成功 (总耗时 {d}ms, load_task={d}ms load_ds={d}ms dup={d}ms pool_init={d}ms sync_task_init={d}ms spawn={d}ms put+status={d}ms)", .{
+            task_id, task.task_name, t7 - t0, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t6 - t5, t7 - t6,
+        });
     }
 
     /// 停止一个任务

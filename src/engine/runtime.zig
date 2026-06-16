@@ -109,7 +109,10 @@ pub const SyncTask = struct {
             try self.processBatch(rows);
             self.allocator.free(last); last=try self.allocator.dupe(u8,rows[rows.len-1].pk_value);
             common.logger.inf("[task {d}] {d}行 pk={s}",.{self.cfg.task_id,rows.len,last});
-            std.Io.sleep(zfinal.io_instance.io,.fromMilliseconds(@intCast(self.cfg.full_sync_sleep_ms)),.real) catch {};
+            _ = std.c.nanosleep(&.{
+                .sec = @intCast(@divTrunc(self.cfg.full_sync_sleep_ms, 1000)),
+                .nsec = @intCast(@mod(self.cfg.full_sync_sleep_ms, 1000) * 1_000_000),
+            }, null);
         }
     }
 
