@@ -36,3 +36,66 @@ pub fn verifyPassword(password: []const u8, hash: []const u8) bool {
     const expected = hash[colon + 1 ..];
     return std.mem.eql(u8, &digest_hex, expected);
 }
+
+test "hashPassword: format is salt:digest" {
+    const a = std.testing.allocator;
+    const h = try hashPassword(a, "hello-world");
+    defer a.free(h);
+    // 32-char salt hex + ':' + 64-char digest hex = 97 chars
+    try std.testing.expectEqual(@as(usize, 97), h.len);
+    const colon_idx = std.mem.indexOfScalar(u8, h, ':').?;
+    try std.testing.expectEqual(@as(usize, 32), colon_idx);
+    // Salt must be valid hex
+    for (h[0..32]) |c| {
+        try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
+    }
+    // Digest part must be valid hex
+    for (h[33..]) |c| {
+        try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
+    }
+}
+
+test "hashPassword: each call produces a different salt" {
+    const a = std.testing.allocator;
+    const h1 = try hashPassword(a, "same-password");
+    defer a.free(h1);
+    const h2 = try hashPassword(a, "same-password");
+    defer a.free(h2);
+    // Different salts → different hashes
+    try std.testing.expect(!std.mem.eql(u8, h1, h2));
+}
+
+test "verifyPassword: correct password returns true" {
+    const a = std.testing.allocator;
+    const plain = "MyStr0ng!Pass";
+    const h = try hashPassword(a, plain);
+    defer a.free(h);
+    try std.testing.expect(verifyPassword(plain, h));
+}
+
+test "verifyPassword: wrong password returns false" {
+    const a = std.testing.allocator;
+    const h = try hashPassword(a, "right-password");
+    defer a.free(h);
+    try std.testing.expect(!verifyPassword("wrong-password", h));
+}
+
+test "verifyPassword: malformed hash returns false" {
+    // No colon
+    try std.testing.expect(!verifyPassword("anything", "no-colon-here"));
+    // Wrong salt length
+    try std.testing.expect(!verifyPassword("anything", "ab:00"));
+    // Garbage salt hex
+    try std.testing.expect(!verifyPassword("anything", "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz:00"));
+    // Empty
+    try std.testing.expect(!verifyPassword("anything", ""));
+}
+
+test "verifyPassword: chinese password roundtrip" {
+    const a = std.testing.allocator;
+    const plain = "数据库密码-mall#001";
+    const h = try hashPassword(a, plain);
+    defer a.free(h);
+    try std.testing.expect(verifyPassword(plain, h));
+    try std.testing.expect(!verifyPassword("not-it", h));
+}

@@ -49,3 +49,107 @@ pub fn verifyUserPassword(store: *meta.store.MetaStore, username: []const u8, pa
 pub fn updateLoginTime(store: *meta.store.MetaStore, username: []const u8) !void {
     try store.db.execParams("UPDATE user SET last_login_at=datetime('now') WHERE username=$1", &.{.{.text=username}});
 }
+
+fn makeTestStore(allocator: std.mem.Allocator) !meta.store.MetaStore {
+    return try meta.store.MetaStore.init(allocator, ":memory:");
+}
+
+test "createUser: insert returns positive id" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    const id = try createUser(&store, a, "alice", "secret", "Alice", "alice@example.com");
+    try std.testing.expect(id > 0);
+}
+
+test "createUser: stored password is hashed not plaintext" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    _ = try createUser(&store, a, "bob", "plain-pw", "", "");
+    var r = try store.db.queryParams("SELECT password_hash FROM user WHERE username=$1", &.{.{.text="bob"}});
+    defer r.deinit();
+    if (r.next()) {
+        const hash = r.getText(0).?;
+        try std.testing.expect(!std.mem.eql(u8, hash, "plain-pw"));
+        try std.testing.expect(std.mem.indexOfScalar(u8, hash, ':') != null);
+    } else {
+        return error.TestFailed;
+    }
+}
+
+test "findAll: lists all users" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    _ = try createUser(&store, a, "u1", "p1", "", "");
+    _ = try createUser(&store, a, "u2", "p2", "", "");
+    _ = try createUser(&store, a, "u3", "p3", "", "");
+
+    const users = try findAll(&store, a);
+    defer {
+        for (users) |*u| u.deinit(a);
+        a.free(users);
+    }
+    try std.testing.expectEqual(@as(usize, 3), users.len);
+    try std.testing.expectEqualStrings("u1", users[0].username);
+    try std.testing.expectEqualStrings("u2", users[1].username);
+    try std.testing.expectEqualStrings("u3", users[2].username);
+}
+
+test "findAll: empty store returns empty slice" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    const users = try findAll(&store, a);
+    defer a.free(users);
+    try std.testing.expectEqual(@as(usize, 0), users.len);
+}
+
+test "verifyUserPassword: correct password returns true" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    _ = try createUser(&store, a, "carol", "goodpass", "", "");
+    try std.testing.expect(verifyUserPassword(&store, "carol", "goodpass"));
+}
+
+test "verifyUserPassword: wrong password returns false" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    _ = try createUser(&store, a, "dave", "rightpw", "", "");
+    try std.testing.expect(!verifyUserPassword(&store, "dave", "wrongpw"));
+}
+
+test "verifyUserPassword: nonexistent user returns false" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    try std.testing.expect(!verifyUserPassword(&store, "ghost", "whatever"));
+}
+
+test "updateLoginTime: sets last_login_at to non-empty" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    _ = try createUser(&store, a, "eve", "pw", "", "");
+    try updateLoginTime(&store, "eve");
+
+    var r = try store.db.queryParams("SELECT last_login_at FROM user WHERE username=$1", &.{.{.text="eve"}});
+    defer r.deinit();
+    if (r.next()) {
+        const ts = r.getText(0) orelse "";
+        try std.testing.expect(ts.len > 0);
+    } else {
+        return error.TestFailed;
+    }
+}

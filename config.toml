@@ -27,3 +27,10 @@ max_retries = 3
 
 [log]
 level = "info"
+
+[reconcile]
+enabled = true
+# 支持 @hourly / @daily / @weekly / @monthly / @yearly
+# 或 5 字段标准 cron (M H DoM Mon DoW), 字段仅支持 * 与单数字
+cron_expr = "0 2 * * *"
+poll_interval_s = 60

@@ -90,10 +90,58 @@ const cfg = .{ .host = host }; // 指向堆
 ## 测试
 
 ```
-31 个单元测试覆盖:
-  crypto (2) / mapper (5) / commission (6) / engine (2)
-  sink (10) / meta (1) / poller (1) / web (1) / config (1)
-  main (2)
+71 个单元测试覆盖:
+  crypto (2) / mapper (5) / commission (9, 含 loadCommissionRules 3 个) / engine (2)
+  sink (10) / meta (1) / poller (1) / web (1) / config (2, 含 reconcile 段)
+  auth/role/bcrypt/user (新增) / alarm / reconcile (9 个 cron 新增) / audit / main (2)
 
 SQLite + MySQL 双构建通过
 ```
+
+## P1 任务 1.5: 归集库不可达优雅降级 (2026-06)
+
+佣金规则加载 (`transform.commission.loadCommissionRules`) 设计为**绝不抛 error**:
+- 归集库不可达 / 表不存在 / 解析失败 → 打 warn + 返回空切片
+- `engine.runtime.SyncTask` 新增 `last_rules_loaded_at: std.atomic.Value(i64)` +
+  `rules_max_age_sec: i64 = 300` (5 min), 由 `reloadRulesIfStale()` 触发 stale-retry
+- 等归集库恢复后, 下次同步周期 (≤5 min) 自动重新拉取
+
+新测试:
+- `loadCommissionRules: graceful degradation when rules table missing` — pool OK, 表不存在 → 降级空
+- `loadCommissionRules: returns empty on closed-port MySQL host` — 文档化 unreachable 场景
+- `loadCommissionRules: returns rules on healthy sink (SQLite stub)` — 正常 path
+
+## P1 任务 1.2: 对账 Cron 调度 (2026-06)
+
+`src/reconcile/cron.zig` 实现了**进程内轻量级线程化 cron** (不依赖 zfinal CronPlugin, 它会拉起 MySQL):
+- `CronConfig` (enabled / cron_expr / poll_interval_s) + `config.Config.ReconcileConfig` 双向转换
+- 解析支持 `@hourly` / `@daily` / `@weekly` / `@monthly` / `@yearly` 简写 + 5 字段标准 cron
+  (字段仅支持 `*` 与单数字; 其他语法 → `error.InvalidCronExpression`)
+- `CronSchedule` 是位图表示的 5 字段时间表, `matches(timestamp)` 按 minute 粒度判断
+- `init()` 启动 `std.Thread.spawn` 后台线程, 周期 `poll_interval_s` (默认 60s) 检查
+- `last_fire_minute` 原子去重, 避免同分钟多次触发; 启动时初始化为当前分钟, 避免开机立即 fire
+- `runNow(ctx, task_id)` 手动触发 (供测试 / API)
+- `deinit()` 设 `running=false` → join 线程 → 释放堆字符串
+
+`[reconcile]` 配置段 (新增, 可选, 无则用默认值):
+```toml
+[reconcile]
+enabled = true
+cron_expr = "0 2 * * *"   # @daily / @weekly / 5 字段
+poll_interval_s = 60
+```
+
+调用流程 (在 `src/main.zig` 启动 web 前注入):
+```zig
+const cron_cfg = reconcile.cron.CronConfig.fromReconcileConfig(cfg.reconcile);
+const cron_ctx = reconcile.cron.init(allocator, scheduler, &store, cron_cfg) catch ...;
+defer cron_ctx.deinit();   // 进程退出时优雅停机
+```
+
+新测试 (9 个):
+- `cron parse @daily / @hourly / @weekly / @monthly` — 简写解析
+- `cron parse 5-field` — 标准 5 字段 + 越界拒绝
+- `cron parse invalid` — 非数字 / 字段数错 / 值越界
+- `cron matches at midnight UTC` — 已知 epoch 命中 / 漏命中
+- `cron matches at specific minute` — `30 14 * * *` 命中 14:30
+- `cron fromReconcileConfig` — Config → CronConfig 转换

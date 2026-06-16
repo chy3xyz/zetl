@@ -14,12 +14,15 @@ pub fn loginV2(ctx: *zfinal.Context) !void {
     if (au.verifyUserPassword(web_deps.store_ptr, v.username, v.password)) {
         au.updateLoginTime(web_deps.store_ptr, v.username) catch {};
         const t = try web_deps.tokenMgr.generate();
+        // 绑定 token → username, 让 permissionInterceptor 能反查用户身份
+        web_deps.bindTokenToUser(t, v.username) catch {};
         try response.ok(ctx, .{.token=t,.expires_in=3600,.username=v.username});
         return;
     }
     // fallback V1 admin
     if (std.mem.eql(u8, v.username, web_deps.config_ptr.meta.admin_username) and std.mem.eql(u8, v.password, web_deps.config_ptr.meta.admin_password)) {
         const t = try web_deps.tokenMgr.generate();
+        web_deps.bindTokenToUser(t, v.username) catch {};
         try response.ok(ctx, .{.token=t,.expires_in=3600,.username=v.username});
         return;
     }

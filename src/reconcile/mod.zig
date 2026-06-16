@@ -40,3 +40,6 @@ pub const ReconcileConfig = struct {
     diff_amount_threshold: f64 = 100.0,
     retention_days: u32 = 90,
 };
+
+/// V2.1+ cron 调度子模块
+pub const cron = @import("cron.zig");

@@ -24,6 +24,11 @@ pub const SyncTask = struct {
     src_pool: *zfinal.ConnectionPool,
     _sh: []u8, _sd: []u8, _su: []u8, _sp: []u8, // 持有 src DBConfig 的 dupe'd 字符串
     is_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// 上次成功加载佣金规则的 Unix 时间 (秒). 0 = 从未成功加载过.
+    /// 用于 stale-retry: 归集库恢复后, 每隔 rules_max_age_sec 再尝试拉一次.
+    last_rules_loaded_at: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    /// 规则过期阈值 (秒). 默认 300s = 5 min. 0 = 每次同步都重新加载.
+    rules_max_age_sec: i64 = 300,
     pos: meta.position.SyncPosition, status: i32 = 1, last_error: ?[]const u8 = null,
     thread: ?std.Thread = null,
 
@@ -66,8 +71,11 @@ pub const SyncTask = struct {
         if (self.cfg.sync_mode == .full or self.cfg.sync_mode == .both) self.runFull() catch |err| {
             common.logger.err_("[task {d}] 全量: {s}", .{self.cfg.task_id,@errorName(err)}); self.markError(@errorName(err));
         };
-        if (self.cfg.enable_commission_calc and self.status == 1) self.loadRules() catch |err|
-            common.logger.warn("[task {d}] 佣金: {s}", .{self.cfg.task_id,@errorName(err)});
+        // 启动时 / 全量后尝试加载佣金规则; enable_commission_calc 为 true 才需要.
+        // 归集库不可达时 loadRules 内部已优雅降级 (打 warn + 空规则), 不抛 error.
+        if (self.cfg.enable_commission_calc and self.status == 1) {
+            self.reloadRulesIfStale();
+        }
     }
 
     fn runFull(self: *SyncTask) !void {
@@ -114,15 +122,39 @@ pub const SyncTask = struct {
         meta.metrics.Service.incrementSuccess(self.store, self.cfg.task_id, @intCast(rows.len)) catch {};
     }
 
-    fn loadRules(self: *SyncTask) !void {
-        const conn = self.sink_pool.acquire() catch return error.PoolExhausted;
-        defer self.sink_pool.release(conn) catch {};
-        var rs = conn.query("SELECT id,agent_id,mall_id,min_amount,max_amount,commission_rate FROM agent_commission_rule WHERE status=1") catch return;
-        defer rs.deinit();
-        var rules = std.ArrayList(transform.commission.CommissionRule).empty;
-        defer { for (rules.items) |*r| r.deinit(self.allocator); rules.deinit(self.allocator); }
-        while (rs.next()) { if (rs.getCurrentRowMap()) |rm| try rules.append(self.allocator, .{.id=try std.fmt.parseInt(i64,rm.get("id") orelse "0",10),.agent_id=try self.allocator.dupe(u8,rm.get("agent_id") orelse ""),.mall_id=try self.allocator.dupe(u8,rm.get("mall_id") orelse "*"),.min_amount=try std.fmt.parseFloat(f64,rm.get("min_amount") orelse "0"),.max_amount=try std.fmt.parseFloat(f64,rm.get("max_amount") orelse "999999"),.rate=try std.fmt.parseFloat(f64,rm.get("commission_rate") orelse "0")}); }
-        try self.transformer.setRules(rules.items);
+    /// 加载佣金规则 (委托给 transform.commission.loadCommissionRules).
+    /// 内部已优雅降级: 归集库不可达时返回空切片, 不抛 error.
+    /// 成功加载后更新 last_rules_loaded_at.
+    fn loadRules(self: *SyncTask) void {
+        const rules = transform.commission.loadCommissionRules(self.sink_pool, self.allocator);
+        // setRules 在内部 deep-dupe 字符串, 因此我们用完 rules 后必须释放外层切片.
+        self.transformer.setRules(rules) catch |err| {
+            common.logger.warn("[task {d}] 佣金规则 setRules 失败: {s}", .{ self.cfg.task_id, @errorName(err) });
+            transform.commission.freeCommissionRules(self.allocator, rules);
+            return;
+        };
+        defer transform.commission.freeCommissionRules(self.allocator, rules);
+
+        if (rules.len > 0) {
+            const now = curTs();
+            self.last_rules_loaded_at.store(now, .release);
+            common.logger.inf("[task {d}] 加载 {d} 条佣金规则", .{ self.cfg.task_id, rules.len });
+        } else {
+            common.logger.warn("[task {d}] 佣金规则为空 (归集库可能不可达)", .{self.cfg.task_id});
+        }
+    }
+
+    /// Stale-retry: 如果距上次成功加载已过 rules_max_age_sec, 再尝试加载一次.
+    /// 每次都重置 last_rules_loaded_at = 0 表示"待重试", 不管成败.
+    /// P1 任务 1.5: 归集库恢复后, 下次同步周期自动重新拉取.
+    pub fn reloadRulesIfStale(self: *SyncTask) void {
+        const last = self.last_rules_loaded_at.load(.acquire);
+        const now = curTs();
+        if (last != 0 and (now - last) < self.rules_max_age_sec) {
+            // 规则新鲜, 跳过
+            return;
+        }
+        self.loadRules();
     }
 
     fn markError(self: *SyncTask, msg: []const u8) void { self.status=2; if (self.last_error) |e| self.allocator.free(e); self.last_error=self.allocator.dupe(u8,msg) catch null; meta.task.Service.updateStatus(self.store,self.cfg.task_id,2,msg) catch {}; }

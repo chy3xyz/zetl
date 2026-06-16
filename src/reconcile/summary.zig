@@ -293,3 +293,113 @@ fn rowToRecRecord(a: std.mem.Allocator, row: zfinal.ResultSet.RowMap) !RecRecord
         .reconcile_time = try a.dupe(u8, rt_s),
     };
 }
+
+// ===== 单元测试 (P1 任务 1.3: 对账模块) =====
+fn makeTestStore(a: std.mem.Allocator) !meta.store.MetaStore {
+    return try meta.store.MetaStore.init(a, ":memory:");
+}
+
+/// 直接调用 saveRecord 等价路径, 插入测试数据
+fn insertTestRecord(
+    store: *meta.store.MetaStore,
+    mall_id: []const u8,
+    table_name: []const u8,
+    src_count: i64,
+    tgt_count: i64,
+    src_amount: f64,
+    tgt_amount: f64,
+    is_abnormal: bool,
+) !i64 {
+    const sql: [:0]const u8 =
+        "INSERT INTO reconcile_record (mall_id, table_name, source_count, target_count, diff_count, " ++
+        "source_amount, target_amount, diff_amount, is_abnormal) " ++
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+    try store.db.execParams(sql, &.{
+        .{ .text = mall_id },
+        .{ .text = table_name },
+        .{ .int = src_count },
+        .{ .int = tgt_count },
+        .{ .int = src_count - tgt_count },
+        .{ .real = src_amount },
+        .{ .real = tgt_amount },
+        .{ .real = src_amount - tgt_amount },
+        .{ .int = if (is_abnormal) 1 else 0 },
+    });
+    return try store.db.lastInsertId();
+}
+
+test "summary.getRecord: returns null for non-existent id" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    const result = try getRecord(&store, a, 99999);
+    try std.testing.expect(result == null);
+}
+
+test "summary.getRecord: returns inserted record" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    const id = try insertTestRecord(&store, "mall_001", "orders", 100, 95, 1234.5, 1200.0, true);
+    try std.testing.expect(id > 0);
+
+    const rec_opt = try getRecord(&store, a, id);
+    try std.testing.expect(rec_opt != null);
+    var got = rec_opt.?;
+    defer got.deinit(a);
+
+    try std.testing.expectEqual(id, got.id);
+    try std.testing.expectEqualStrings("mall_001", got.mall_id);
+    try std.testing.expectEqualStrings("orders", got.table_name);
+    try std.testing.expectEqual(@as(i64, 100), got.source_count);
+    try std.testing.expectEqual(@as(i64, 95), got.target_count);
+    try std.testing.expectEqual(@as(i64, 5), got.diff_count);
+    try std.testing.expectEqual(@as(i32, 1), got.is_abnormal);
+}
+
+test "summary.listRecords: returns all records in DESC order" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    const id1 = try insertTestRecord(&store, "m1", "t1", 10, 10, 100.0, 100.0, false);
+    const id2 = try insertTestRecord(&store, "m2", "t2", 20, 15, 200.0, 150.0, true);
+    _ = id1; // id1 仅用于保证 2 条记录存在; 断言用 id2
+
+    const list = try listRecords(&store, a);
+    defer {
+        for (list) |*r| r.deinit(a);
+        a.free(list);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    // DESC order: id2 first
+    try std.testing.expectEqual(id2, list[0].id);
+    try std.testing.expectEqualStrings("m2", list[0].mall_id);
+    try std.testing.expectEqualStrings("m1", list[1].mall_id);
+}
+
+test "summary.listRecords: empty store returns empty slice" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    const list = try listRecords(&store, a);
+    defer a.free(list);
+
+    try std.testing.expectEqual(@as(usize, 0), list.len);
+}
+
+test "summary.RecRecord.deinit: frees owned strings" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    const id = try insertTestRecord(&store, "mall_x", "table_x", 1, 1, 1.0, 1.0, false);
+    const rec_opt = try getRecord(&store, a, id);
+    try std.testing.expect(rec_opt != null);
+    var got = rec_opt.?;
+    got.deinit(a); // 不应泄漏
+}

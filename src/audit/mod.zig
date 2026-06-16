@@ -30,3 +30,62 @@ pub fn logFromCtx(ctx: *zfinal.Context, store: *meta.store.MetaStore, op_type: [
         null;
     logOp(store, operator, op_type, op_target, op_detail, ip_str) catch {};
 }
+
+// ===== 单元测试 =====
+fn makeTestStore(a: std.mem.Allocator) !meta.store.MetaStore {
+    return try meta.store.MetaStore.init(a, ":memory:");
+}
+
+test "audit.logOp: insert log row succeeds" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    try logOp(&store, "admin", "user.create", "user:1", "create user foo", "127.0.0.1");
+    try logOp(&store, "alice", "task.start", "task:42", null, null);
+
+    const sql: [:0]const u8 = "SELECT COUNT(*) FROM operation_log";
+    var result = try store.db.query(sql);
+    defer result.deinit();
+    try std.testing.expect(result.next());
+    const cnt = (try result.getInt(0)) orelse 0;
+    try std.testing.expectEqual(@as(i64, 2), cnt);
+}
+
+test "audit.logOp: detail and ip null are stored as NULL" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    try logOp(&store, "bob", "datasource.test", "ds:5", null, null);
+
+    const sql: [:0]const u8 = "SELECT op_detail, ip FROM operation_log LIMIT 1";
+    var result = try store.db.query(sql);
+    defer result.deinit();
+    try std.testing.expect(result.next());
+    // getText returns null for NULL column
+    try std.testing.expect(result.getText(0) == null);
+    try std.testing.expect(result.getText(1) == null);
+}
+
+test "audit.logOp: multiple ops are independently retrievable" {
+    const a = std.testing.allocator;
+    var store = try makeTestStore(a);
+    defer store.deinit();
+
+    try logOp(&store, "u1", "login", "u1", "ok", "10.0.0.1");
+    try logOp(&store, "u2", "logout", "u2", "ok", "10.0.0.2");
+    try logOp(&store, "u3", "task.stop", "task:7", "manual stop", null);
+
+    const sql: [:0]const u8 = "SELECT operator, op_type FROM operation_log ORDER BY id";
+    var result = try store.db.query(sql);
+    defer result.deinit();
+    try std.testing.expect(result.next());
+    try std.testing.expectEqualStrings("u1", result.getText(0) orelse "");
+    try std.testing.expectEqualStrings("login", result.getText(1) orelse "");
+    try std.testing.expect(result.next());
+    try std.testing.expectEqualStrings("u2", result.getText(0) orelse "");
+    try std.testing.expect(result.next());
+    try std.testing.expectEqualStrings("u3", result.getText(0) orelse "");
+    try std.testing.expect(!result.next());
+}

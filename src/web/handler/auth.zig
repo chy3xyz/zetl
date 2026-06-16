@@ -49,10 +49,12 @@ pub fn me(ctx: *zfinal.Context) !void {
 /// 主动销毁走 validate() 在某些 zfinal 版本下会卡住 (mutex + cleanExpired 死锁)
 /// 如需服务端立即失效, 改用 exists() + 自定义删除
 pub fn logout(ctx: *zfinal.Context) !void {
-    _ = response.extractToken(ctx) orelse {
+    const token = response.extractToken(ctx) orelse {
         try response.fail(ctx, .permission_denied, "未携带 token");
         return;
     };
+    // 解除 token → username 绑定 (RBAC 中间件用)
+    deps.unbindToken(token);
     // V1 简化: 客户端丢弃 token, 服务端在 TTL 过期后自动清理
     try response.ok(ctx, .{ .logged_out = true, .note = "请在客户端丢弃 token, 服务端将在 TTL 过期后清理" });
 }

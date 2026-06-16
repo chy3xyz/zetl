@@ -21,6 +21,10 @@ pub fn main(init: std.process.Init) !void {
     zfinal.io_instance.init(init);
     const allocator = init.gpa;
 
+    // 0. P1 任务 1.8: 优雅停机 - 注册 SIGINT/SIGTERM handler
+    //    zfinal.shutdown 用 atomic flag 置位, server.acceptLoop 在下个循环迭代时退出
+    zfinal.shutdown.registerHandlers();
+
     // 1. 加载配置
     var cfg = try config_mod.loadConfig(allocator, "config.toml");
     defer cfg.deinit(allocator);
@@ -63,8 +67,25 @@ pub fn main(init: std.process.Init) !void {
     app.setPort(cfg.server.port);
     try web.routes.registerAll(&app, allocator, &cfg, &store, scheduler, token_mgr, sink_pool);
 
+    // 9. 启动对账 Cron 后台线程 (V2.1+)
+    const cron_cfg = reconcile.cron.CronConfig.fromReconcileConfig(cfg.reconcile);
+    const cron_ctx = reconcile.cron.init(allocator, scheduler, &store, cron_cfg) catch |err| {
+        common.logger.err_("cron init 失败: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer cron_ctx.deinit();
+
     common.logger.inf("zetl V2 服务启动, 端口: {d}", .{cfg.server.port});
     try app.start();
+
+    // 10. P1 任务 1.8: app.start() 返回后做收尾
+    //    信号已被 zfinal.shutdown 捕获, isShuttingDown() = true
+    if (zfinal.shutdown.isShuttingDown()) {
+        common.logger.warn("收到停机信号, 正在停止调度器...", .{});
+        // 软等待 30s 让运行中 task 跑完当前 batch
+        const stopped = scheduler.stopAll(30_000);
+        common.logger.inf("已停止 {d} 个任务, 退出", .{stopped});
+    }
 }
 
 // ===== 单元测试 =====
@@ -84,6 +105,7 @@ test {
     _ = @import("web/auth_middleware.zig");
     _ = @import("reconcile/summary.zig");
     _ = @import("reconcile/handler.zig");
+    _ = @import("reconcile/cron.zig");
     _ = @import("alarm/rule.zig");
     _ = @import("alarm/webhook.zig");
     _ = @import("alarm/handler.zig");

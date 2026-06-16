@@ -9,6 +9,7 @@ pub const Config = struct {
     sink: SinkConfig,
     engine: EngineConfig,
     log: LogConfig,
+    reconcile: ReconcileConfig,
 
     pub const ServerConfig = struct {
         host: []const u8 = "0.0.0.0",
@@ -43,6 +44,15 @@ pub const Config = struct {
         level: []const u8 = "info",
     };
 
+    /// 对账 cron 配置 (V2.1+)
+    /// enabled = false 时, 后台线程不启动, 仅依赖手动 API 触发
+    /// cron_expr 支持 @hourly/@daily/@weekly/@monthly/@yearly 或 5 字段标准 cron
+    pub const ReconcileConfig = struct {
+        enabled: bool = true,
+        cron_expr: []const u8 = "@daily",
+        poll_interval_s: u64 = 60,
+    };
+
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.server.host);
         allocator.free(self.meta.sqlite_path);
@@ -53,12 +63,13 @@ pub const Config = struct {
         allocator.free(self.sink.username);
         allocator.free(self.sink.password);
         allocator.free(self.log.level);
+        allocator.free(self.reconcile.cron_expr);
     }
 };
 
 /// 加载配置文件. 若文件不存在则返回默认值.
 pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !Config {
-    var cfg: Config = .{ .server = .{}, .meta = .{}, .sink = .{}, .engine = .{}, .log = .{} };
+    var cfg: Config = .{ .server = .{}, .meta = .{}, .sink = .{}, .engine = .{}, .log = .{}, .reconcile = .{} };
 
     const zfinal = @import("zfinal");
     const io = zfinal.io_instance.io;
@@ -122,6 +133,8 @@ fn parseSection(section: []const u8, cfg: *Config, allocator: std.mem.Allocator,
         try parseKVSection(content, p, cfg, allocator, EngineApplier.apply);
     } else if (std.mem.eql(u8, section, "log")) {
         try parseKVSection(content, p, cfg, allocator, LogApplier.apply);
+    } else if (std.mem.eql(u8, section, "reconcile")) {
+        try parseKVSection(content, p, cfg, allocator, ReconcileApplier.apply);
     } else {
         // 跳过未知段
         while (p.* < content.len) {
@@ -179,6 +192,18 @@ const LogApplier = struct {
     }
 };
 
+const ReconcileApplier = struct {
+    fn apply(allocator: std.mem.Allocator, k: []const u8, v: []const u8, c: *Config) !void {
+        if (std.mem.eql(u8, k, "enabled")) {
+            c.reconcile.enabled = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+        } else if (std.mem.eql(u8, k, "cron_expr")) {
+            c.reconcile.cron_expr = try allocator.dupe(u8, v);
+        } else if (std.mem.eql(u8, k, "poll_interval_s")) {
+            c.reconcile.poll_interval_s = @intCast(try std.fmt.parseInt(u64, v, 10));
+        }
+    }
+};
+
 fn parseKVSection(content: []const u8, p: *usize, cfg: *Config, allocator: std.mem.Allocator, applyFn: ApplyFn) !void {
     while (true) {
         skipWs(content, p);
@@ -212,4 +237,14 @@ test "parse config default" {
     // 端口不写死, 只断言 > 0
     try std.testing.expect(cfg.server.port > 0);
     try std.testing.expectEqualStrings("admin", cfg.meta.admin_username);
+}
+
+test "parse config reconcile section" {
+    const a = std.testing.allocator;
+    const cfg = try loadConfig(a, "config.toml");
+    var mutable = cfg;
+    defer mutable.deinit(a);
+    // 配置文件无 [reconcile] 段时应使用默认值
+    try std.testing.expect(cfg.reconcile.poll_interval_s > 0);
+    try std.testing.expect(cfg.reconcile.cron_expr.len > 0);
 }
