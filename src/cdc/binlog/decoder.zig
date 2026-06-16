@@ -338,6 +338,14 @@ test "decodeColumn for TINY returns decimal" {
     try std.testing.expectEqualStrings("42", out);
 }
 
+test "decodeColumn for TINY returns negative signed value" {
+    var pos: usize = 0;
+    const buf = [_]u8{0xff};
+    const out = try decodeColumn(std.testing.allocator, 0x01, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("-1", out);
+}
+
 test "decodeColumn for SHORT returns decimal" {
     var pos: usize = 0;
     const buf = [_]u8{ 0xff, 0x00 }; // 255

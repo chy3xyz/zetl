@@ -5,25 +5,32 @@
 //!                   WRITE_ROWS_EVENT_V2 (生成 RowEvent 列表).
 //! 阶段 2 (Task 3): DELETE_ROWS_EVENT_V2 解析 (before image).
 //! 阶段 2 (Task 4): UPDATE_ROWS_EVENT_V2 解析 (before/after 双镜像).
-//! 阶段 3 (后续): 更多 MySQL 字段类型解码.
+//! 阶段 2b: 扩展 decoder.zig, 新增 DATETIME / DATETIME2 / NEWDECIMAL /
+//!         BLOB / TEXT / JSON / VARCHAR>255 解码.
 //!
 //! ## 支持的 MySQL 字段类型
-//! - INTEGER 家族 (统一按无符号小端读取, 输出十进制字符串):
+//! - INTEGER 家族 (按有符号小端读取, 输出十进制字符串; 负值带 `-` 前缀):
 //!     TINYINT (0x01, 1B), SHORT (0x02, 2B), INT24 (0x09, 3B),
 //!     LONG (0x03, 4B), LONGLONG (0x08, 8B)
-//! - VARCHAR (0x0f): max_bytes ≤ 255 时按 1 字节长度 + N 字节数据解码.
+//! - VARCHAR (0x0f): 当 metadata 中的 max_length ≤ 255 时读 1 字节长度,
+//!     否则读 2 字节长度, 然后读 N 字节数据 (Phase 2b 新增 >255 路径).
+//! - DATETIME (0x0c): 8 字节 packed datetime → `YYYY-MM-DD HH:MM:SS`.
+//! - DATETIME2 (0x12): 5 字节 packed datetime + fsp 字节小数 (1..3 字节).
+//! - NEWDECIMAL (0xf6): 按 `decimal2bin` wire format 解码, 支持负数.
+//! - BLOB 变种 (0xfc) / TEXT (0xfd) / JSON (0xf5): 按 metadata 的
+//!     pack_length (1/2/3/4) 读前缀长度, 然后读 N 字节原始数据.
 //!
-//! ## 不支持的类型 (占位 0 字节, 字段值固定为字符串 "TODO")
-//! FLOAT / DOUBLE / DATE / TIME / DATETIME / TIMESTAMP / BLOB / TEXT /
-//! JSON / DECIMAL / BIT / ENUM / SET / 几何类型 / 等.
-//! 后续 Task 添加解码 (Task 9c).
+//! ## 不支持的类型 (返回 error.UnsupportedType)
+//! FLOAT / DOUBLE / DATE / TIME / TIMESTAMP / BIT / ENUM / SET / 几何类型 / YEAR /
+//! OLD DECIMAL 等. 这些列在 TABLE_MAP 中识别到但 decodeColumn 拒绝并向上抛错.
 //!
 //! ## 限制
 //! - 仅支持 ROWS_EVENT v2 (MySQL 5.6+ 默认); v1 (0x17) 未实现
 //! - WRITE/UPDATE/DELETE_ROWS_EVENT_V2 已解析
 //! - 列名固定为 `c0`, `c1`, ... (binlog 流不含列名, 需外部 transform 映射)
 //! - 假定 binlog_row_image=FULL (binlog 含所有列, used_bitmap 全 1)
-//! - column_metadata 暂不解析 (后续支持 VARCHAR>255/CHAR 时按类型步进)
+//! - column_metadata 按列类型步进解析; 缓冲不足时 metadataForColumn 返回空切片,
+//!     decoder 会进一步返回 error.InvalidValue, 不会越界访问.
 
 const std = @import("std");
 const event_mod = @import("../event.zig");
@@ -78,14 +85,18 @@ pub const TableMap = struct {
 
     /// 返回 column `col_idx` 在 column_metadata 中对应的切片.
     /// 通过累加前面所有列的 metadata 长度计算偏移, 然后按本列长度切片.
-    /// 调用方应保证 `col_idx < self.column_types.len` 且
-    /// `column_metadata` 总长与各列 metadata 长度之和一致 (由 parseTableMap 保证).
+    /// 当 metadata 缓冲比预期短时返回空切片 (调用方按需返回 error.InvalidValue),
+    /// 这样即使上游 parseTableMap 的 metadata_length 字段被截断 / 不一致,
+    /// 也不会越界访问, 也不会抛出未定义行为.
     pub fn metadataForColumn(self: TableMap, col_idx: usize) []const u8 {
         var offset: usize = 0;
         for (self.column_types[0..col_idx]) |t| {
             offset += decoder.metadataLengthForType(t);
         }
         const len = decoder.metadataLengthForType(self.column_types[col_idx]);
+        if (offset + len > self.column_metadata.len) {
+            return &[_]u8{};
+        }
         return self.column_metadata[offset..][0..len];
     }
 };

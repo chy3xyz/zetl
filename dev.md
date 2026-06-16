@@ -58,5 +58,5 @@
 ## 已知限制
 
 - **伪 CDC → 真 CDC**: V1/V2 基于 `update_time` 轮询; V3 新增真 binlog CDC (`sync_mode=binlog/both`), 可感知物理删除. 已落地为 phase 1, 详见 docs/superpowers/specs/2026-06-16-zetl-v3-binlog-cdc-design.md.
-- **V3 binlog parser phase 2b**: 已支持 DATETIME / DATETIME2 / NEWDECIMAL / BLOB / TEXT / JSON / VARCHAR(>255) 解码. 不支持 DATE / TIME / TIMESTAMP / FLOAT / DOUBLE / BIT / ENUM / SET / GEOMETRY, 这些列返回 `error.UnsupportedType`. 已支持自动剥离 4 字节 CRC32 校验和 (`binlog_checksum=NONE` 不再是必须). SHOW MASTER STATUS 在 MySQL 8.0.22+ 改为 SHOW BINARY LOG STATUS.
+- **V3 binlog parser phase 2b**: 已支持 DATETIME / DATETIME2 / NEWDECIMAL / BLOB / TEXT / JSON / VARCHAR (≤255 已支持, 新增 >255 双字节长度) 解码. 不支持 DATE / TIME / TIMESTAMP / FLOAT / DOUBLE / BIT / ENUM / SET / GEOMETRY, 这些列返回 `error.UnsupportedType`. 已支持自动剥离 4 字节 CRC32 校验和 (`binlog_checksum=NONE` 不再是必须). SHOW MASTER STATUS 在 MySQL 8.0.22+ 改为 SHOW BINARY LOG STATUS.
 - **优雅停机**: ✅ zfinal v0.10.8 已修复; SIGTERM/SIGINT 可在 ~3s 内完成停机, 无 panic, 无泄漏.
