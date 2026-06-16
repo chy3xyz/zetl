@@ -7,17 +7,20 @@ const store_mod = @import("store.zig");
 
 pub const SyncStage = enum {
     full, // 全量阶段 (主键分页)
-    incremental, // 增量阶段 (update_time 游标)
+    incremental, // 增量阶段 (update_time 游标, poll 模式)
+    binlog, // MySQL binlog CDC 阶段
 
     pub fn toString(s: SyncStage) []const u8 {
         return switch (s) {
             .full => "full",
             .incremental => "incremental",
+            .binlog => "binlog",
         };
     }
 
     pub fn fromString(s: []const u8) SyncStage {
         if (std.mem.eql(u8, s, "incremental")) return .incremental;
+        if (std.mem.eql(u8, s, "binlog")) return .binlog;
         return .full;
     }
 };
@@ -29,22 +32,27 @@ pub const SyncPosition = struct {
     last_event_time: ?[]const u8 = null,
     stage: SyncStage = .full,
     updated_at: []const u8 = "",
+    binlog_file: []const u8 = "",
+    binlog_pos: u64 = 0,
 
     pub fn deinit(self: *SyncPosition, allocator: std.mem.Allocator) void {
         allocator.free(self.last_pk);
         allocator.free(self.last_update_time);
         if (self.last_event_time) |e| allocator.free(e);
         allocator.free(self.updated_at);
+        allocator.free(self.binlog_file);
     }
 
     pub fn isInitial(self: *const SyncPosition) bool {
-        return self.last_pk.len == 0 and self.last_update_time.len == 0;
+        return self.last_pk.len == 0 and self.last_update_time.len == 0 and self.binlog_file.len == 0;
     }
 };
 
 pub const Service = struct {
     pub fn load(store: *store_mod.MetaStore, allocator: std.mem.Allocator, task_id: i64) !SyncPosition {
-        const sql: [:0]const u8 = "SELECT task_id, last_pk, last_update_time, last_event_time, stage, updated_at FROM sync_position WHERE task_id = $1";
+        const sql: [:0]const u8 =
+            "SELECT task_id, last_pk, last_update_time, last_event_time, stage, updated_at, " ++
+            "binlog_file, binlog_pos FROM sync_position WHERE task_id = $1";
         var result = try store.db.queryParams(sql, &.{.{ .int = task_id }});
         defer result.deinit();
         if (result.next()) {
@@ -54,6 +62,8 @@ pub const Service = struct {
                 const last_et_s = row.get("last_event_time") orelse "";
                 const stage_s = row.get("stage") orelse "full";
                 const updated_s = row.get("updated_at") orelse "";
+                const binlog_file_s = row.get("binlog_file") orelse "";
+                const binlog_pos_s = row.get("binlog_pos") orelse "0";
 
                 return SyncPosition{
                     .task_id = try std.fmt.parseInt(i64, row.get("task_id") orelse "0", 10),
@@ -62,6 +72,8 @@ pub const Service = struct {
                     .last_event_time = if (last_et_s.len == 0) null else try allocator.dupe(u8, last_et_s),
                     .stage = SyncStage.fromString(stage_s),
                     .updated_at = try allocator.dupe(u8, updated_s),
+                    .binlog_file = try allocator.dupe(u8, binlog_file_s),
+                    .binlog_pos = std.fmt.parseInt(u64, binlog_pos_s, 10) catch 0,
                 };
             }
         }
@@ -70,14 +82,16 @@ pub const Service = struct {
 
     pub fn save(store: *store_mod.MetaStore, pos: SyncPosition) !void {
         const sql: [:0]const u8 =
-            "INSERT INTO sync_position (task_id, last_pk, last_update_time, last_event_time, stage, updated_at) " ++
-            "VALUES ($1, $2, $3, $4, $5, datetime('now')) " ++
+            "INSERT INTO sync_position (task_id, last_pk, last_update_time, last_event_time, stage, updated_at, binlog_file, binlog_pos) " ++
+            "VALUES ($1, $2, $3, $4, $5, datetime('now'), $6, $7) " ++
             "ON CONFLICT(task_id) DO UPDATE SET " ++
             "last_pk = excluded.last_pk, " ++
             "last_update_time = excluded.last_update_time, " ++
             "last_event_time = excluded.last_event_time, " ++
             "stage = excluded.stage, " ++
-            "updated_at = excluded.updated_at";
+            "updated_at = excluded.updated_at, " ++
+            "binlog_file = excluded.binlog_file, " ++
+            "binlog_pos = excluded.binlog_pos";
 
         const event_param: zfinal.SqlParam = if (pos.last_event_time) |e| .{ .text = e } else .null;
         try store.db.execParams(sql, &.{
@@ -86,6 +100,8 @@ pub const Service = struct {
             .{ .text = pos.last_update_time },
             event_param,
             .{ .text = pos.stage.toString() },
+            .{ .text = pos.binlog_file },
+            .{ .int = @intCast(pos.binlog_pos) },
         });
     }
 

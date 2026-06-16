@@ -86,3 +86,20 @@ CREATE TABLE IF NOT EXISTS `agent_commission_rule` (
 -- ---------- 2. 元数据 (SQLite, 由 src/meta/store.zig 自动建表) ----------
 -- 元数据表结构与 docs/ard.md §1.2 一致
 -- 表: datasource / sync_task / sync_position / alarm_config / operation_log / reconcile_record / runtime_metrics
+
+-- 同步位点 (V3 binlog CDC 扩展 binlog_file + binlog_pos)
+CREATE TABLE IF NOT EXISTS sync_position (
+  task_id INTEGER PRIMARY KEY,
+  last_pk TEXT NOT NULL DEFAULT '',
+  last_update_time TEXT NOT NULL DEFAULT '',
+  last_event_time TEXT,
+  stage TEXT NOT NULL DEFAULT 'full',
+  updated_at TEXT DEFAULT (datetime('now')),
+  binlog_file TEXT NOT NULL DEFAULT '',
+  binlog_pos INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY (task_id) REFERENCES sync_task(id)
+);
+
+-- 已部署数据库迁移语句 (SQLite)
+ALTER TABLE sync_position ADD COLUMN binlog_file TEXT NOT NULL DEFAULT '';
+ALTER TABLE sync_position ADD COLUMN binlog_pos INTEGER NOT NULL DEFAULT 0;
