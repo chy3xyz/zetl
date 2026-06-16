@@ -281,13 +281,24 @@ pub const SyncTask = struct {
         }
     }
 
-    /// 从 src_pool 拿一个连接跑 SHOW MASTER STATUS, 返回当前 binlog 位点.
+    /// 从 src_pool 拿一个连接查询当前 binlog 位点.
+    /// MySQL 8 优先使用 SHOW BINARY LOG STATUS, 失败则回退到 SHOW MASTER STATUS.
     /// 启动位点无持久化值时调用. file 由 allocator.dupe, 调用方负责释放 (start_pos 借用, 不 free).
     fn queryMasterStatus(self: *SyncTask) !BinlogStartPos {
         const conn = try self.src_pool.acquire();
         defer self.src_pool.release(conn) catch {};
-        var result = try conn.query("SHOW MASTER STATUS");
+
+        var result = blk: {
+            break :blk conn.query("SHOW BINARY LOG STATUS") catch |err| {
+                common.logger.warn(
+                    "[task {d}] SHOW BINARY LOG STATUS failed ({s}), falling back to SHOW MASTER STATUS",
+                    .{ self.cfg.task_id, @errorName(err) },
+                );
+                break :blk try conn.query("SHOW MASTER STATUS");
+            };
+        };
         defer result.deinit();
+
         if (result.next()) {
             if (result.getCurrentRowMap()) |row| {
                 const file = row.get("File") orelse return error.MissingMasterStatus;
