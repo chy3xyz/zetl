@@ -128,6 +128,20 @@ pub const TransformEngine = struct {
         try target.put(mall_key, mall_dup);
         try target.put(source_type_key, source_type_dup);
 
+        // 4.1 delete 事件软删除: 强制设置 is_delete = 1
+        if (event.op == .delete) {
+            const k = try self.allocator.dupe(u8, "is_delete");
+            errdefer self.allocator.free(k);
+            const v = try self.allocator.dupe(u8, "1");
+            errdefer self.allocator.free(v);
+            // 如果已有 is_delete, remove 并释放旧内存
+            if (target.fetchRemove("is_delete")) |old| {
+                self.allocator.free(old.key);
+                self.allocator.free(old.value);
+            }
+            try target.put(k, v);
+        }
+
         // 5. 过滤 (skip = 不通过 filter, 即 predicate 为 false)
         if (self.cfg.filter_field) |ff| {
             if (target.get(ff)) |fv| {
@@ -215,4 +229,34 @@ test "transform: filter rejects below-threshold" {
 
     const result = eng.process(ev);
     try std.testing.expectError(TransformError.FilterSkip, result);
+}
+
+test "transform: delete event sets is_delete=1" {
+    const a = std.testing.allocator;
+    var eng = try TransformEngine.init(a, .{
+        .mall_id = "mall_003",
+    });
+    defer eng.deinit();
+
+    var fields = std.StringHashMap([]const u8).init(a);
+    defer fields.deinit();
+    try fields.put("order_no", "ON_DEL_001");
+    try fields.put("agent_id", "A001");
+    try fields.put("order_total", "100.00");
+
+    const ev = cdc.event.RowEvent{
+        .op = .delete,
+        .table = "order_info",
+        .database = "zetl_source",
+        .fields = fields,
+        .timestamp = 0,
+        .pk_value = "99",
+    };
+
+    var target = try eng.process(ev);
+    defer freeRowData(a, &target);
+
+    try std.testing.expectEqualStrings("1", target.get("is_delete").?);
+    try std.testing.expectEqualStrings("mall_003", target.get("mall_id").?);
+    try std.testing.expectEqualStrings("ON_DEL_001", target.get("order_no").?);
 }

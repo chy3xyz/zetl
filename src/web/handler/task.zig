@@ -15,7 +15,7 @@ pub fn create(ctx: *zfinal.Context) !void {
         datasource_id: i64,
         source_table: []const u8,
         target_table: []const u8,
-        sync_mode: []const u8 = "cdc",
+        sync_mode: []const u8 = "both",
         field_mappings: ?[]const u8 = null,
         filter_condition: ?[]const u8 = null,
         batch_size: i32 = 1000,

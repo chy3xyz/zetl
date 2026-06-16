@@ -22,6 +22,7 @@ pub const SyncTask = struct {
     transformer: transform.engine.TransformEngine, sink: sink_mod.mysql_sink.MySqlSink,
     store: *meta.store.MetaStore, sink_pool: *zfinal.ConnectionPool,
     src_pool: *zfinal.ConnectionPool,
+    poller: cdc.poller.Poller,
     _sh: []u8, _sd: []u8, _su: []u8, _sp: []u8, // 持有 src DBConfig 的 dupe'd 字符串
     is_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 上次成功加载佣金规则的 Unix 时间 (秒). 0 = 从未成功加载过.
@@ -32,7 +33,7 @@ pub const SyncTask = struct {
     pos: meta.position.SyncPosition, status: i32 = 1, last_error: ?[]const u8 = null,
     thread: ?std.Thread = null,
 
-    pub fn init(a: std.mem.Allocator, cfg: RuntimeConfig, _: meta.datasource.Datasource, store: *meta.store.MetaStore,
+    pub fn init(a: std.mem.Allocator, cfg: RuntimeConfig, ds: meta.datasource.Datasource, store: *meta.store.MetaStore,
                sp: *zfinal.ConnectionPool, src_pool: *zfinal.ConnectionPool,
                src_host: []u8, src_db: []u8, src_user: []u8, src_pass: []u8) !SyncTask {
         const mid = try a.dupe(u8, cfg.mall_id);
@@ -41,7 +42,9 @@ pub const SyncTask = struct {
         const tr = try transform.engine.TransformEngine.init(a, .{.mall_id=mid,.source_type="mysql",.field_mappings_json=fm,.enable_commission_calc=cfg.enable_commission_calc});
         const sk = sink_mod.mysql_sink.MySqlSink.init(a, sp, tgt, cfg.batch_size, "order_no");
         const po = try meta.position.Service.load(store, a, cfg.task_id);
-        return .{.allocator=a,.cfg=cfg,.transformer=tr,.sink=sk,.store=store,.sink_pool=sp,.src_pool=src_pool,
+        const pl_cfg = cdc.poller.PollerConfig.fromSlices(src_host, ds.port, src_user, src_pass, src_db, cfg.source_table, cfg.pk_column, cfg.update_time_column, @intCast(cfg.batch_size));
+        const pl = cdc.poller.Poller.init(a, pl_cfg, src_pool);
+        return .{.allocator=a,.cfg=cfg,.transformer=tr,.sink=sk,.store=store,.sink_pool=sp,.src_pool=src_pool,.poller=pl,
             ._sh=src_host,._sd=src_db,._su=src_user,._sp=src_pass,.pos=po};
     }
 
@@ -66,63 +69,118 @@ pub const SyncTask = struct {
     }
 
     fn runLoop(self: *SyncTask) void {
-        common.logger.inf("[task {d}] 启动", .{self.cfg.task_id});
+        common.logger.inf("[task {d}] 启动 stage={s}", .{self.cfg.task_id, self.pos.stage.toString()});
         defer common.logger.inf("[task {d}] 退出", .{self.cfg.task_id});
-        if (self.cfg.sync_mode == .full or self.cfg.sync_mode == .both) self.runFull() catch |err| {
-            common.logger.err_("[task {d}] 全量: {s}", .{self.cfg.task_id,@errorName(err)}); self.markError(@errorName(err));
-        };
+
         // 启动时 / 全量后尝试加载佣金规则; enable_commission_calc 为 true 才需要.
         // 归集库不可达时 loadRules 内部已优雅降级 (打 warn + 空规则), 不抛 error.
-        if (self.cfg.enable_commission_calc and self.status == 1) {
+        if (self.cfg.enable_commission_calc) {
             self.reloadRulesIfStale();
+        }
+
+        // 1. 全量阶段 (sync_mode=full/both 或 stage=full)
+        if (self.pos.stage == .full and (self.cfg.sync_mode == .full or self.cfg.sync_mode == .both)) {
+            self.runFull() catch |err| {
+                common.logger.err_("[task {d}] 全量: {s}", .{self.cfg.task_id,@errorName(err)}); self.markError(@errorName(err));
+                return;
+            };
+        }
+
+        // 2. 增量阶段 (sync_mode=cdc/both)
+        if (self.is_running.load(.acquire) and (self.cfg.sync_mode == .cdc or self.cfg.sync_mode == .both)) {
+            self.runIncremental() catch |err| {
+                common.logger.err_("[task {d}] 增量: {s}", .{self.cfg.task_id,@errorName(err)}); self.markError(@errorName(err));
+            };
         }
     }
 
     fn runFull(self: *SyncTask) !void {
         common.logger.inf("[task {d}] 全量 pk='{s}'", .{self.cfg.task_id, self.pos.last_pk});
-        const conn = self.src_pool.acquire() catch |err| {
-            common.logger.err_("[task {d}] srcAcquire: {s}", .{self.cfg.task_id,@errorName(err)}); return err;
-        };
-        defer self.src_pool.release(conn) catch {};
-
         var last = try self.allocator.dupe(u8, if (self.pos.last_pk.len>0) self.pos.last_pk else "0");
         defer self.allocator.free(last);
         while (self.is_running.load(.acquire)) {
-            const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM `order_info` WHERE `id` > '{s}' ORDER BY `id` ASC LIMIT {d}", .{last,self.cfg.batch_size});
-            defer self.allocator.free(sql);
-            const sz = try allocS(self.allocator, sql); defer self.allocator.free(sz);
-            var rs = conn.query(sz) catch |err| { common.logger.err_("[task {d}] q: {s}",.{self.cfg.task_id,@errorName(err)}); return err; };
-            defer rs.deinit();
-            const now = curTs(); const cols = rs.columnCount();
-            var evs = std.ArrayList(cdc.event.RowEvent).empty;
-            while (rs.next()) {
-                var ev = cdc.event.RowEvent{.op=.insert,.table=try self.allocator.dupe(u8,"order_info"),.database=try self.allocator.dupe(u8,"zetl_source"),.fields=std.StringHashMap([]const u8).init(self.allocator),.timestamp=now,.pk_value=""};
-                for (0..cols) |i| {
-                    const cn = rs.columnName(i) orelse continue; const v = rs.getText(i) orelse "";
-                    try ev.fields.put(try self.allocator.dupe(u8,cn), try self.allocator.dupe(u8,v));
-                    if (std.mem.eql(u8,cn,"id")) { self.allocator.free(ev.pk_value); ev.pk_value=try self.allocator.dupe(u8,v); }
-                }
-                try evs.append(self.allocator, ev);
+            const rows = try self.poller.fetchFullBatch(last);
+            if (rows.len==0) {
+                common.logger.inf("[task {d}] 全量完成",.{self.cfg.task_id});
+                // 切换到增量阶段
+                self.pos.stage = .incremental;
+                try self.savePosition();
+                break;
             }
-            const rows = try evs.toOwnedSlice(self.allocator);
-            if (rows.len==0) { common.logger.inf("[task {d}] 全量完成",.{self.cfg.task_id}); break; }
-            try self.processBatch(rows);
-            self.allocator.free(last); last=try self.allocator.dupe(u8,rows[rows.len-1].pk_value);
+            // 先提取下一批游标, 再处理/释放本批
+            const next_pk = try self.allocator.dupe(u8, rows[rows.len-1].pk_value);
+            errdefer self.allocator.free(next_pk);
+            try self.processBatch(rows, .insert);
+            self.freeRowEvents(rows);
+            self.allocator.free(last); last = next_pk;
+            // 释放旧 pos.last_pk 再赋值新值
+            self.allocator.free(self.pos.last_pk);
+            self.pos.last_pk = try self.allocator.dupe(u8, last);
+            try self.savePosition();
             common.logger.inf("[task {d}] {d}行 pk={s}",.{self.cfg.task_id,rows.len,last});
-            _ = std.c.nanosleep(&.{
-                .sec = @intCast(@divTrunc(self.cfg.full_sync_sleep_ms, 1000)),
-                .nsec = @intCast(@mod(self.cfg.full_sync_sleep_ms, 1000) * 1_000_000),
-            }, null);
+            sleepMs(self.cfg.full_sync_sleep_ms);
         }
     }
 
-    fn processBatch(self: *SyncTask, rows: []cdc.event.RowEvent) !void {
+    fn runIncremental(self: *SyncTask) !void {
+        common.logger.inf("[task {d}] 增量 last_update_time='{s}' last_pk='{s}'", .{self.cfg.task_id, self.pos.last_update_time, self.pos.last_pk});
+        var last_ut = try self.allocator.dupe(u8, if (self.pos.last_update_time.len>0) self.pos.last_update_time else "1970-01-01 00:00:00");
+        defer self.allocator.free(last_ut);
+        var last_pk = try self.allocator.dupe(u8, if (self.pos.last_pk.len>0) self.pos.last_pk else "0");
+        defer self.allocator.free(last_pk);
+        while (self.is_running.load(.acquire)) {
+            const rows = try self.poller.fetchIncrementalBatch(last_ut, last_pk);
+            if (rows.len > 0) {
+                const next_ut = try self.allocator.dupe(u8, rows[rows.len-1].fields.get(self.cfg.update_time_column) orelse "");
+                errdefer self.allocator.free(next_ut);
+                const next_pk = try self.allocator.dupe(u8, rows[rows.len-1].pk_value);
+                errdefer self.allocator.free(next_pk);
+                try self.processBatch(rows, .insert);
+                self.freeRowEvents(rows);
+                self.allocator.free(last_ut); last_ut = next_ut;
+                self.allocator.free(last_pk); last_pk = next_pk;
+                self.allocator.free(self.pos.last_update_time);
+                self.pos.last_update_time = try self.allocator.dupe(u8, last_ut);
+                self.allocator.free(self.pos.last_pk);
+                self.pos.last_pk = try self.allocator.dupe(u8, last_pk);
+                try self.savePosition();
+                common.logger.inf("[task {d}] 增量 {d}行 ut={s} pk={s}",.{self.cfg.task_id,rows.len,last_ut,last_pk});
+            }
+            sleepMs(self.cfg.incremental_poll_ms);
+        }
+    }
+
+    fn savePosition(self: *SyncTask) !void {
+        try meta.position.Service.save(self.store, self.pos);
+    }
+
+    fn sleepMs(ms: u64) void {
+        _ = std.c.nanosleep(&.{
+            .sec = @intCast(@divTrunc(ms, 1000)),
+            .nsec = @intCast(@mod(ms, 1000) * 1_000_000),
+        }, null);
+    }
+
+    fn processBatch(self: *SyncTask, rows: []cdc.event.RowEvent, default_op: cdc.event.RowOp) !void {
         for (rows) |*ev| {
+            // 轮询式 CDC 只能拿到当前快照, 默认当作 insert/update(upsert).
+            // 如果源表存在 is_delete=1, 则生成 delete 事件做软删除.
+            var op = default_op;
+            if (ev.fields.get("is_delete")) |v| {
+                if (std.mem.eql(u8, v, "1")) op = .delete;
+            }
+            ev.op = op;
             const t = self.transformer.process(ev.*) catch |err| switch(err) { transform.engine.TransformError.FilterSkip=>continue, else=>{common.logger.warn("[task {d}] xf: {s}",.{self.cfg.task_id,@errorName(err)}); continue;} };
             try self.sink.append(t);
         }
         try self.sink.flush();
         meta.metrics.Service.incrementSuccess(self.store, self.cfg.task_id, @intCast(rows.len)) catch {};
+        // 注意: rows 由调用方释放, 以便调用方在释放前读取最后一条的游标字段
+    }
+
+    fn freeRowEvents(self: *SyncTask, rows: []cdc.event.RowEvent) void {
+        for (rows) |*ev| ev.deinit(self.allocator);
+        self.allocator.free(rows);
     }
 
     /// 加载佣金规则 (委托给 transform.commission.loadCommissionRules).

@@ -52,7 +52,7 @@ pub const CreateInput = struct {
     datasource_id: i64,
     source_table: []const u8,
     target_table: []const u8,
-    sync_mode: SyncMode = .cdc,
+    sync_mode: SyncMode = .both,
     field_mappings: ?[]const u8 = null, // JSON 文本
     filter_condition: ?[]const u8 = null,
     batch_size: i32 = 1000,

@@ -65,14 +65,14 @@ pub const PollerConfig = struct {
 pub const Poller = struct {
     allocator: std.mem.Allocator,
     cfg: PollerConfig,
-    db: ?zfinal.DB = null,
+    pool: *zfinal.ConnectionPool,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: PollerConfig) Poller {
-        return .{ .allocator = allocator, .cfg = cfg };
+    pub fn init(allocator: std.mem.Allocator, cfg: PollerConfig, pool: *zfinal.ConnectionPool) Poller {
+        return .{ .allocator = allocator, .cfg = cfg, .pool = pool };
     }
 
     pub fn deinit(self: *Poller) void {
-        if (self.db) |*db| db.deinit();
+        _ = self;
     }
 
     pub fn fetchFullBatch(self: *Poller, last_pk: []const u8) ![]event_mod.RowEvent {
@@ -83,31 +83,27 @@ pub const Poller = struct {
         return try self.queryRows(sql);
     }
 
-    pub fn fetchIncrementalBatch(self: *Poller, last_update_time: []const u8) ![]event_mod.RowEvent {
+    /// 增量轮询. 使用 (update_time > last_ut) OR (update_time = last_ut AND pk > last_pk)
+    /// 避免同一 update_time 的数据被反复读取.
+    pub fn fetchIncrementalBatch(self: *Poller, last_update_time: []const u8, last_pk: []const u8) ![]event_mod.RowEvent {
         const sql = try std.fmt.allocPrint(self.allocator,
-            "SELECT * FROM `{s}` WHERE `{s}` > '{s}' ORDER BY `{s}` ASC LIMIT {d}",
-            .{ self.cfg.tableZ(), self.cfg.utZ(), last_update_time, self.cfg.utZ(), self.cfg.batch_size });
+            "SELECT * FROM `{s}` WHERE `{s}` > '{s}' OR (`{s}` = '{s}' AND `{s}` > '{s}') ORDER BY `{s}` ASC, `{s}` ASC LIMIT {d}",
+            .{
+                self.cfg.tableZ(), self.cfg.utZ(), last_update_time,
+                self.cfg.utZ(), last_update_time, self.cfg.pkZ(), last_pk,
+                self.cfg.utZ(), self.cfg.pkZ(), self.cfg.batch_size,
+            });
         defer self.allocator.free(sql);
         return try self.queryRows(sql);
     }
 
     fn queryRows(self: *Poller, sql: []const u8) ![]event_mod.RowEvent {
-        if (self.db == null) {
-            // 使用相同的硬编码配置（验证主线程 OK，线程中也 OK）
-            const cfg = zfinal.DBConfig{
-                .db_type = .mysql,
-                .host = "127.0.0.1",
-                .port = 3306,
-                .database = "zetl_source",
-                .username = "root",
-                .password = "",
-            };
-            self.db = try zfinal.DB.init(self.allocator, cfg);
-        }
+        const conn = self.pool.acquire() catch |err| return err;
+        defer self.pool.release(conn) catch {};
 
         const sql_z = try allocSentinel(self.allocator, sql);
         defer self.allocator.free(sql_z);
-        var result = try self.db.?.query(sql_z);
+        var result = try conn.query(sql_z);
         defer result.deinit();
 
         const cols = result.columnCount();
@@ -129,7 +125,10 @@ pub const Poller = struct {
                 const v = result.getText(i) orelse "";
                 const vd = try self.allocator.dupe(u8, v);
                 try ev.fields.put(cnd, vd);
-                if (std.mem.eql(u8, cn, self.cfg.pkZ())) ev.pk_value = vd;
+                if (std.mem.eql(u8, cn, self.cfg.pkZ())) {
+                    // pk_value 单独分配, 避免与 fields 中的 value 共享同一块内存导致 double free
+                    ev.pk_value = try self.allocator.dupe(u8, v);
+                }
             }
             try list.append(self.allocator, ev);
         }
