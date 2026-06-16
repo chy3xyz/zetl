@@ -56,6 +56,7 @@ pub fn decodeColumn(
         0x0c => decodeDatetime(allocator, body, pos),
         0x12 => decodeDatetime2(allocator, metadata, body, pos),
         0xf6 => decodeDecimal(allocator, metadata, body, pos),
+        0xfc, 0xfd, 0xf5 => decodeBlobLike(allocator, metadata, body, pos),
         else => return error.UnsupportedType,
     };
 }
@@ -282,6 +283,28 @@ fn decodeDecimal(allocator: std.mem.Allocator, metadata: []const u8, body: []con
     return out.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
+/// BLOB (0xfc) / VAR_STRING used as TEXT (0xfd) / JSON (0xf5).
+///
+/// MySQL encodes these as a `pack_length`-byte little-endian length prefix
+/// followed by that many raw bytes. `pack_length` lives in `metadata[0]`
+/// and is 1/2/3/4 depending on the column's maximum size.
+fn decodeBlobLike(allocator: std.mem.Allocator, metadata: []const u8, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (metadata.len < 1) return error.InvalidValue;
+    const pack_length: usize = metadata[0];
+    if (pack_length < 1 or pack_length > 4) return error.InvalidValue;
+    if (body.len < pos.* + pack_length) return error.BufferTooShort;
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < pack_length) : (i += 1) {
+        len |= @as(usize, body[pos.* + i]) << @intCast(i * 8);
+    }
+    pos.* += pack_length;
+    if (body.len < pos.* + len) return error.BufferTooShort;
+    const value = allocator.dupe(u8, body[pos.*..][0..len]) catch return error.OutOfMemory;
+    pos.* += len;
+    return value;
+}
+
 /// Append `n_digits` decimal digits of `value` to `out`, zero-padded on the
 /// left. Assumes `value < 10^n_digits` (caller's responsibility).
 fn appendLimbDigits(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u32, n_digits: usize) !void {
@@ -440,4 +463,34 @@ test "decodeColumn for NEWDECIMAL(5,2) decodes 123.45 from real wire bytes" {
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("123.45", out);
     try std.testing.expectEqual(@as(usize, 3), pos);
+}
+
+test "decodeColumn for BLOB with 1-byte length reads N bytes" {
+    var pos: usize = 0;
+    const buf = [_]u8{ 5, 'h', 'e', 'l', 'l', 'o' };
+    const meta = [_]u8{1}; // pack_length=1
+    const out = try decodeColumn(std.testing.allocator, 0xfc, &meta, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("hello", out);
+    try std.testing.expectEqual(@as(usize, 6), pos);
+}
+
+test "decodeColumn for TEXT with 2-byte length reads N bytes" {
+    var pos: usize = 0;
+    const buf = [_]u8{ 5, 0, 'w', 'o', 'r', 'l', 'd' };
+    const meta = [_]u8{2}; // pack_length=2
+    const out = try decodeColumn(std.testing.allocator, 0xfd, &meta, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("world", out);
+    try std.testing.expectEqual(@as(usize, 7), pos);
+}
+
+test "decodeColumn for JSON with 4-byte length reads N bytes" {
+    var pos: usize = 0;
+    const buf = [_]u8{ 1, 0, 0, 0, '{' };
+    const meta = [_]u8{4}; // pack_length=4
+    const out = try decodeColumn(std.testing.allocator, 0xf5, &meta, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("{", out);
+    try std.testing.expectEqual(@as(usize, 5), pos);
 }
