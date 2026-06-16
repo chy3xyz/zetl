@@ -323,9 +323,12 @@ pub const SyncTask = struct {
 
     fn processBatch(self: *SyncTask, rows: []cdc.event.RowEvent, default_op: cdc.event.RowOp) !void {
         for (rows) |*ev| {
-            // 轮询式 CDC 只能拿到当前快照, 默认当作 insert/update(upsert).
-            // 如果源表存在 is_delete=1, 则生成 delete 事件做软删除.
-            var op = default_op;
+            // 轮询式 CDC 只能拿到当前快照, 默认当作 upsert.
+            // binlog 行已经带有正确的 op (insert/update/delete), 直接采用.
+            var op = ev.op;
+            if (op == .insert and default_op != .insert) {
+                op = default_op;
+            }
             if (ev.fields.get("is_delete")) |v| {
                 if (std.mem.eql(u8, v, "1")) op = .delete;
             }
