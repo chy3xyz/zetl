@@ -147,18 +147,25 @@ pub const Parser = struct {
     pub fn processEvent(self: *Parser, buffer: []const u8) ParseError!ParsedEvent {
         const header = try parseHeader(buffer);
         const event_type: EventType = @enumFromInt(header.type_code);
-        const body = buffer[19..];
+
+        // MySQL 在 binlog 事件尾部追加 4 字节 CRC32 校验和.
+        // 这里假设服务端启用了 CRC32 (即非 binlog_checksum=NONE); 否则 event_size 不会包含 CRC,
+        // 继续减 4 会截断真实 body. V3 默认要求 binlog_checksum = CRC32.
+        if (header.event_size < 19) return error.InvalidEvent;
+        const body_end = if (header.event_size >= 19 + 4) header.event_size - 4 else header.event_size;
+        if (buffer.len < body_end) return error.BufferTooShort;
+        const body = buffer[19..body_end];
 
         return switch (event_type) {
             .rotate => try parseRotate(self.allocator, header, body),
             .heartbeat => ParsedEvent.heartbeat,
             .table_map => try self.processTableMap(body),
             .write_rows_v2 => try self.parseWriteRows(header, body),
+            // TODO: UPDATE/DELETE_ROWS_EVENT 解析 (后续 Task).
+            // 当前: 跳过事件体, 返回空 RowEvent 切片.
+            // 实现 UPDATE 时需注意: UPDATE_ROWS_EVENT_V2 在 used_bitmap 之后
+            // 多一个 columns_used_for_update_bitmap (用于 binlog_row_image=FULL 模式).
             .update_rows_v2, .delete_rows_v2 => blk: {
-                // TODO: UPDATE/DELETE_ROWS_EVENT 解析 (后续 Task)
-                // 当前: 跳过事件体, 返回空 RowEvent 切片.
-                // 实现 UPDATE 时需注意: UPDATE_ROWS_EVENT 在 used_bitmap 之后
-                // 多一个 columns_used_for_update_bitmap (用于 image FULL 模式).
                 break :blk ParsedEvent{ .row = &.{} };
             },
             else => ParsedEvent{ .unknown = header },
@@ -276,10 +283,10 @@ pub const Parser = struct {
 // ============================================================================
 
 fn parseRotate(allocator: std.mem.Allocator, header: EventHeader, body: []const u8) ParseError!ParsedEvent {
+    _ = header;
     if (body.len < 8) return error.BufferTooShort;
     const rot_pos = std.mem.readInt(u64, body[0..8], .little);
-    const name_len: usize = @intCast(header.event_size - 19 - 8);
-    if (body.len < 8 + name_len) return error.BufferTooShort;
+    const name_len = body.len - 8;
     const name = body[8..][0..name_len];
     return ParsedEvent{ .rotate = .{
         .file = try allocator.dupe(u8, name),
@@ -467,6 +474,37 @@ test "parseHeader with buffer too short returns BufferTooShort" {
     try std.testing.expectError(error.BufferTooShort, parseHeader(&.{}));
 }
 
+test "processEvent returns InvalidEvent when event_size < 19" {
+    const a = std.testing.allocator;
+    var p = Parser.init(a);
+    defer p.deinit();
+
+    var buf: [19]u8 = undefined;
+    @memset(&buf, 0);
+    buf[4] = 0x13; // TABLE_MAP
+    std.mem.writeInt(u32, buf[5..9], 1, .little);
+    std.mem.writeInt(u32, buf[9..13], 18, .little); // event_size < 19
+    std.mem.writeInt(u32, buf[13..17], 0, .little);
+    std.mem.writeInt(u16, buf[17..19], 0, .little);
+    try std.testing.expectError(error.InvalidEvent, p.processEvent(&buf));
+}
+
+test "processEvent returns BufferTooShort when buffer shorter than body_end" {
+    const a = std.testing.allocator;
+    var p = Parser.init(a);
+    defer p.deinit();
+
+    // TABLE_MAP: event_size = 40 (含 CRC), 但 buffer 只有 35 字节, 小于 body_end = 36.
+    var buf: [35]u8 = undefined;
+    @memset(&buf, 0);
+    buf[4] = 0x13;
+    std.mem.writeInt(u32, buf[5..9], 1, .little);
+    std.mem.writeInt(u32, buf[9..13], 40, .little);
+    std.mem.writeInt(u32, buf[13..17], 0, .little);
+    std.mem.writeInt(u16, buf[17..19], 0, .little);
+    try std.testing.expectError(error.BufferTooShort, p.processEvent(&buf));
+}
+
 test "Parser init/deinit works" {
     const a = std.testing.allocator;
     var p = Parser.init(a);
@@ -480,17 +518,18 @@ test "Parser processEvent dispatches ROTATE / HEARTBEAT / unknown" {
     var p = Parser.init(a);
     defer p.deinit();
 
-    // ROTATE_EVENT
-    var buf: [64]u8 = undefined;
+    // ROTATE_EVENT: header(19) + pos(8) + name(10) + crc(4) = 41
+    var buf: [41]u8 = undefined;
     @memset(&buf, 0);
     std.mem.writeInt(u32, buf[0..4], 0, .little);
     buf[4] = 0x04; // ROTATE
     std.mem.writeInt(u32, buf[5..9], 1, .little);
-    std.mem.writeInt(u32, buf[9..13], 37, .little);
+    std.mem.writeInt(u32, buf[9..13], 41, .little);
     std.mem.writeInt(u32, buf[13..17], 0, .little);
     std.mem.writeInt(u16, buf[17..19], 0, .little);
     std.mem.writeInt(u64, buf[19..27], 12345, .little);
     @memcpy(buf[27..][0..10], "bin.000001");
+    // bytes 37..40 为 CRC (已清零)
 
     var ev = try p.processEvent(&buf);
     try std.testing.expect(ev == .rotate);
@@ -498,19 +537,24 @@ test "Parser processEvent dispatches ROTATE / HEARTBEAT / unknown" {
     try std.testing.expectEqual(@as(u64, 12345), ev.rotate.pos);
     ev.rotate.deinit(a);
 
-    // HEARTBEAT_EVENT
-    var hb: [19]u8 = undefined;
+    // HEARTBEAT_EVENT: header(19) + crc(4) = 23
+    var hb: [23]u8 = undefined;
     @memset(&hb, 0);
     hb[4] = 0x1b; // HEARTBEAT
     std.mem.writeInt(u32, hb[5..9], 1, .little);
-    std.mem.writeInt(u32, hb[9..13], 19, .little);
+    std.mem.writeInt(u32, hb[9..13], 23, .little);
+    std.mem.writeInt(u32, hb[13..17], 0, .little);
+    std.mem.writeInt(u16, hb[17..19], 0, .little);
+    // bytes 19..22 为 CRC (已清零)
     ev = try p.processEvent(&hb);
     try std.testing.expect(ev == .heartbeat);
 
-    // 未知事件
-    var unk: [19]u8 = undefined;
+    // 未知事件: header(19) + crc(4) = 23
+    var unk: [23]u8 = undefined;
     @memset(&unk, 0);
     unk[4] = 0x99; // 未知类型
+    std.mem.writeInt(u32, unk[9..13], 23, .little);
+    // bytes 19..22 为 CRC (已清零)
     ev = try p.processEvent(&unk);
     try std.testing.expect(ev == .unknown);
     try std.testing.expectEqual(@as(u8, 0x99), ev.unknown.type_code);
@@ -521,17 +565,17 @@ test "Parser parses TABLE_MAP and caches it" {
     var p = Parser.init(a);
     defer p.deinit();
 
-    // TABLE_MAP_EVENT layout: header(19) + body
+    // TABLE_MAP_EVENT layout: header(19) + body + crc(4)
     //   body = table_id(6) + db_len(1) + "db"(2) + NUL(1) + tbl_len(1) + "t"(1) + NUL(1) +
     //          col_count(1) + col_types(1) + meta_len(1) + null_bitmap(1) = 17
-    //   event_size = 19 + 17 = 36
-    var buf: [64]u8 = undefined;
+    //   event_size = 19 + 17 + 4 = 40
+    var buf: [40]u8 = undefined;
     @memset(&buf, 0);
     // header
     std.mem.writeInt(u32, buf[0..4], 0, .little); // timestamp
     buf[4] = 0x13; // TABLE_MAP
     std.mem.writeInt(u32, buf[5..9], 1, .little); // server_id
-    std.mem.writeInt(u32, buf[9..13], 36, .little); // event_size
+    std.mem.writeInt(u32, buf[9..13], 40, .little); // event_size
     std.mem.writeInt(u32, buf[13..17], 0, .little); // log_pos
     std.mem.writeInt(u16, buf[17..19], 0, .little); // flags
     // body
@@ -546,6 +590,7 @@ test "Parser parses TABLE_MAP and caches it" {
     buf[33] = 0x01; // col_type: TINYINT
     buf[34] = 0; // meta_len
     buf[35] = 0; // null_bitmap (1 byte, all zero)
+    // bytes 36..39 为 CRC (已清零)
 
     const ev = try p.processEvent(&buf);
     try std.testing.expect(ev == .table_map);
@@ -563,13 +608,13 @@ test "Parser parses WRITE_ROWS_V2 with single TINYINT row" {
     var p = Parser.init(a);
     defer p.deinit();
 
-    // 1. 先发 TABLE_MAP (1 col TINYINT). body = 17 字节, event_size = 36.
-    var tm_buf: [64]u8 = undefined;
+    // 1. 先发 TABLE_MAP (1 col TINYINT). body = 17 字节, event_size = 19 + 17 + 4 = 40.
+    var tm_buf: [40]u8 = undefined;
     @memset(&tm_buf, 0);
     std.mem.writeInt(u32, tm_buf[0..4], 0, .little);
     tm_buf[4] = 0x13;
     std.mem.writeInt(u32, tm_buf[5..9], 1, .little);
-    std.mem.writeInt(u32, tm_buf[9..13], 36, .little);
+    std.mem.writeInt(u32, tm_buf[9..13], 40, .little);
     std.mem.writeInt(u32, tm_buf[13..17], 0, .little);
     std.mem.writeInt(u16, tm_buf[17..19], 0, .little);
     std.mem.writeInt(u48, tm_buf[19..25], 0x42, .little);
@@ -583,19 +628,20 @@ test "Parser parses WRITE_ROWS_V2 with single TINYINT row" {
     tm_buf[33] = 0x01; // TINYINT
     tm_buf[34] = 0; // no metadata
     tm_buf[35] = 0; // null_bitmap
+    // bytes 36..39 为 CRC (已清零)
     _ = try p.processEvent(&tm_buf);
 
     // 2. 发 WRITE_ROWS_V2: 1 行, 1 列 = 42.
     //    body = post-header(10) + col_count(1) + used_bitmap(1) +
     //           num_rows(1) + null_bitmap(1) + value(1) = 15.
-    //    event_size = 19 + 15 = 34.
-    var wr_buf: [64]u8 = undefined;
+    //    event_size = 19 + 15 + 4 = 38.
+    var wr_buf: [38]u8 = undefined;
     @memset(&wr_buf, 0);
     // header
     std.mem.writeInt(u32, wr_buf[0..4], 0x12345678, .little);
     wr_buf[4] = 0x1e; // WRITE_ROWS_V2
     std.mem.writeInt(u32, wr_buf[5..9], 1, .little);
-    std.mem.writeInt(u32, wr_buf[9..13], 34, .little);
+    std.mem.writeInt(u32, wr_buf[9..13], 38, .little);
     std.mem.writeInt(u32, wr_buf[13..17], 0, .little);
     std.mem.writeInt(u16, wr_buf[17..19], 0, .little);
     // body
@@ -609,6 +655,7 @@ test "Parser parses WRITE_ROWS_V2 with single TINYINT row" {
     wr_buf[31] = 1; // num_rows = 1
     wr_buf[32] = 0x00; // null_bitmap (no NULL)
     wr_buf[33] = 42; // value
+    // bytes 34..37 为 CRC (已清零)
 
     var ev = try p.processEvent(&wr_buf);
     defer freeRowEvents(a, ev.row);
@@ -633,13 +680,13 @@ test "Parser parses WRITE_ROWS_V2 with VARCHAR and LONGLONG columns" {
     //   body = table_id(6) + db_len(1) + "mydb"(4) + NUL(1) +
     //          tbl_len(1) + "tbl"(3) + NUL(1) + col_count(1) + col_types(3) +
     //          meta_len(1) + meta(0) + null_bitmap(1)
-    //   = 6+1+4+1+1+3+1+1+3+1+0+1 = 23. event_size = 19+23 = 42.
-    var tm_buf: [64]u8 = undefined;
+    //   = 6+1+4+1+1+3+1+1+3+1+0+1 = 23. event_size = 19 + 23 + 4 = 46.
+    var tm_buf: [46]u8 = undefined;
     @memset(&tm_buf, 0);
     std.mem.writeInt(u32, tm_buf[0..4], 0, .little);
     tm_buf[4] = 0x13;
     std.mem.writeInt(u32, tm_buf[5..9], 1, .little);
-    std.mem.writeInt(u32, tm_buf[9..13], 42, .little);
+    std.mem.writeInt(u32, tm_buf[9..13], 46, .little);
     std.mem.writeInt(u32, tm_buf[13..17], 0, .little);
     std.mem.writeInt(u16, tm_buf[17..19], 0, .little);
     std.mem.writeInt(u48, tm_buf[19..25], 0x10, .little); // table_id
@@ -655,18 +702,19 @@ test "Parser parses WRITE_ROWS_V2 with VARCHAR and LONGLONG columns" {
     tm_buf[39] = 0x09; // INT24
     tm_buf[40] = 0; // meta_len = 0
     tm_buf[41] = 0; // null_bitmap (1 byte, no NULL)
+    // bytes 42..45 为 CRC (已清零)
     _ = try p.processEvent(&tm_buf);
 
     // WRITE_ROWS_V2: 1 行, 3 列 = [12345, "hi", 0x123456]
     //   col values: LONGLONG(8B) + VARCHAR(1B len + 2B) + INT24(3B) = 14
     //   body = post-header(10) + col_count(1) + used_bitmap(1) + num_rows(1) +
-    //          null_bitmap(1) + values(14) = 28. event_size = 19+28 = 47.
-    var wr_buf: [64]u8 = undefined;
+    //          null_bitmap(1) + values(14) = 28. event_size = 19 + 28 + 4 = 51.
+    var wr_buf: [51]u8 = undefined;
     @memset(&wr_buf, 0);
     std.mem.writeInt(u32, wr_buf[0..4], 0, .little);
     wr_buf[4] = 0x1e;
     std.mem.writeInt(u32, wr_buf[5..9], 1, .little);
-    std.mem.writeInt(u32, wr_buf[9..13], 47, .little);
+    std.mem.writeInt(u32, wr_buf[9..13], 51, .little);
     std.mem.writeInt(u32, wr_buf[13..17], 0, .little);
     std.mem.writeInt(u16, wr_buf[17..19], 0, .little);
     // body
@@ -685,6 +733,7 @@ test "Parser parses WRITE_ROWS_V2 with VARCHAR and LONGLONG columns" {
     wr_buf[44] = 0x56;
     wr_buf[45] = 0x34;
     wr_buf[46] = 0x12;
+    // bytes 47..50 为 CRC (已清零)
 
     var ev = try p.processEvent(&wr_buf);
     defer freeRowEvents(a, ev.row);
@@ -706,16 +755,18 @@ test "Parser WRITE_ROWS_V2 returns empty for unknown table_id" {
     defer p.deinit();
 
     // 没注册 TABLE_MAP, 直接发 WRITE_ROWS_V2
-    var wr_buf: [64]u8 = undefined;
+    // body = 15 字节, event_size = 19 + 15 + 4 = 38
+    var wr_buf: [38]u8 = undefined;
     @memset(&wr_buf, 0);
     std.mem.writeInt(u32, wr_buf[0..4], 0, .little);
     wr_buf[4] = 0x1e;
     std.mem.writeInt(u32, wr_buf[5..9], 1, .little);
-    std.mem.writeInt(u32, wr_buf[9..13], 19 + 15, .little);
+    std.mem.writeInt(u32, wr_buf[9..13], 38, .little);
     std.mem.writeInt(u32, wr_buf[13..17], 0, .little);
     std.mem.writeInt(u16, wr_buf[17..19], 0, .little);
     std.mem.writeInt(u48, wr_buf[19..25], 0xff, .little);
     // 其它字段不重要, 期望在 lookup 时返回 UnknownTableId
+    // bytes 34..37 为 CRC (已清零)
     try std.testing.expectError(error.UnknownTableId, p.processEvent(&wr_buf));
 }
 
@@ -724,14 +775,16 @@ test "Parser UPDATE/DELETE_ROWS return empty row slice with TODO" {
     var p = Parser.init(a);
     defer p.deinit();
 
-    var buf: [19]u8 = undefined;
+    // UPDATE/DELETE_ROWS_V2 空事件: header(19) + crc(4) = 23
+    var buf: [23]u8 = undefined;
     @memset(&buf, 0);
     std.mem.writeInt(u32, buf[0..4], 0, .little);
     buf[4] = 0x1f; // UPDATE_ROWS_V2
     std.mem.writeInt(u32, buf[5..9], 1, .little);
-    std.mem.writeInt(u32, buf[9..13], 19, .little);
+    std.mem.writeInt(u32, buf[9..13], 23, .little);
     std.mem.writeInt(u32, buf[13..17], 0, .little);
     std.mem.writeInt(u16, buf[17..19], 0, .little);
+    // bytes 19..22 为 CRC (已清零)
     var ev = try p.processEvent(&buf);
     try std.testing.expect(ev == .row);
     try std.testing.expectEqual(@as(usize, 0), ev.row.len);
@@ -775,4 +828,56 @@ test "readPackedInt handles 1 / 3 / 4 / 9 byte encodings" {
     r = try readPackedInt(&buf9);
     try std.testing.expectEqual(@as(u64, 1), r.value);
     try std.testing.expectEqual(@as(usize, 9), r.len);
+}
+
+test "processEvent strips 4-byte binlog checksum from WRITE_ROWS_V2" {
+    const a = std.testing.allocator;
+    var p = Parser.init(a);
+    defer p.deinit();
+
+    // TABLE_MAP: 1 col TINYINT, db="db", tbl="t", body = 17 bytes, event_size = 19 + 17 + 4 = 40.
+    var tm_buf: [40]u8 = undefined;
+    @memset(&tm_buf, 0);
+    std.mem.writeInt(u32, tm_buf[0..4], 0, .little);
+    tm_buf[4] = 0x13;
+    std.mem.writeInt(u32, tm_buf[5..9], 1, .little);
+    std.mem.writeInt(u32, tm_buf[9..13], 40, .little);
+    std.mem.writeInt(u32, tm_buf[13..17], 0, .little);
+    std.mem.writeInt(u16, tm_buf[17..19], 0, .little);
+    std.mem.writeInt(u48, tm_buf[19..25], 0x42, .little);
+    tm_buf[25] = 2;
+    @memcpy(tm_buf[26..][0..2], "db");
+    tm_buf[28] = 0;
+    tm_buf[29] = 1;
+    @memcpy(tm_buf[30..][0..1], "t");
+    tm_buf[31] = 0;
+    tm_buf[32] = 1;
+    tm_buf[33] = 0x01; // TINYINT
+    tm_buf[34] = 0;
+    tm_buf[35] = 0;
+    // bytes 36..39 为 CRC (已清零)
+    _ = try p.processEvent(&tm_buf);
+
+    // WRITE_ROWS_V2: 1 row, 1 col = 42. body = 15 bytes, event_size = 19 + 15 + 4 = 38.
+    var wr_buf: [38]u8 = undefined;
+    @memset(&wr_buf, 0);
+    std.mem.writeInt(u32, wr_buf[0..4], 0, .little);
+    wr_buf[4] = 0x1e;
+    std.mem.writeInt(u32, wr_buf[5..9], 1, .little);
+    std.mem.writeInt(u32, wr_buf[9..13], 38, .little);
+    std.mem.writeInt(u32, wr_buf[13..17], 0, .little);
+    std.mem.writeInt(u16, wr_buf[17..19], 0, .little);
+    std.mem.writeInt(u48, wr_buf[19..25], 0x42, .little);
+    wr_buf[29] = 1; // col_count
+    wr_buf[30] = 0x01; // used_bitmap
+    wr_buf[31] = 1; // num_rows
+    wr_buf[32] = 0x00; // null_bitmap
+    wr_buf[33] = 42; // value
+    // bytes 34..37 为 CRC (已清零)
+
+    var ev = try p.processEvent(&wr_buf);
+    defer freeRowEvents(a, ev.row);
+    try std.testing.expect(ev == .row);
+    try std.testing.expectEqual(@as(usize, 1), ev.row.len);
+    try std.testing.expectEqualStrings("42", ev.row[0].getField("c0").?);
 }
