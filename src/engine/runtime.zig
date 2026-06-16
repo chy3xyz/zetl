@@ -24,6 +24,8 @@ pub const SyncTask = struct {
     src_pool: *zfinal.ConnectionPool,
     poller: cdc.poller.Poller,
     _sh: []u8, _sd: []u8, _su: []u8, _sp: []u8, // 持有 src DBConfig 的 dupe'd 字符串
+    /// binlog CDC 用的源库 DB 连接 (P2 Task 11 注入, 当前为 null).
+    binlog_db: ?zfinal.DB = null,
     is_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// runLoop 退出后置 true, 供 stopAll 提前结束等待.
     is_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -95,11 +97,28 @@ pub const SyncTask = struct {
             };
         }
 
-        // 2. 增量阶段 (sync_mode=poll/binlog/both)
-        if (self.is_running.load(.acquire) and (self.cfg.sync_mode == .poll or self.cfg.sync_mode == .binlog or self.cfg.sync_mode == .both)) {
-            self.runIncremental() catch |err| {
-                common.logger.err_("[task {d}] 增量: {s}", .{self.cfg.task_id,@errorName(err)}); self.markError(@errorName(err));
-            };
+        // 2. 增量阶段 (按 sync_mode 分发)
+        if (!self.is_running.load(.acquire)) return;
+
+        // 增量阶段
+        switch (self.cfg.sync_mode) {
+            .full => return,
+            .poll => self.runIncremental() catch |err| {
+                common.logger.err_("[task {d}] 增量轮询: {s}", .{self.cfg.task_id, @errorName(err)});
+                self.markError(@errorName(err));
+            },
+            .binlog, .both => {
+                if (self.pos.stage != .binlog) {
+                    self.pos.stage = .binlog;
+                    self.savePosition() catch |err| {
+                        common.logger.warn("[task {d}] stage→binlog savePosition: {s}", .{self.cfg.task_id, @errorName(err)});
+                    };
+                }
+                self.runBinlogIncremental() catch |err| {
+                    common.logger.err_("[task {d}] binlog: {s}", .{self.cfg.task_id, @errorName(err)});
+                    self.markError(@errorName(err));
+                };
+            },
         }
     }
 
@@ -157,6 +176,16 @@ pub const SyncTask = struct {
             }
             sleepMs(self.cfg.incremental_poll_ms);
         }
+    }
+
+    /// binlog CDC 增量同步 (P2 Task 10 stub, Task 11 wires real DB + BinlogReader loop).
+    /// 当前只检查 binlog_db 是否就绪; 实际 register/dump/replay 由 Task 11 实现.
+    fn runBinlogIncremental(self: *SyncTask) !void {
+        common.logger.inf("[task {d}] 启动 binlog CDC", .{self.cfg.task_id});
+        if (self.binlog_db) |_| {} else return error.NoBinlogDb;
+
+        // Placeholder: Task 11 wires actual DB connection + BinlogReader loop here.
+        return error.NotImplemented;
     }
 
     fn savePosition(self: *SyncTask) !void {
