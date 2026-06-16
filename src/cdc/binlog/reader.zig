@@ -31,7 +31,7 @@ pub const BinlogReader = struct {
 
     pub fn open(self: *BinlogReader, file: []const u8, pos: u64) !void {
         self.close();
-        const file_z = try self.allocator.dupeZ(u8, file);
+        const file_z = try self.allocator.dupeSentinel(u8, file, 0);
         defer self.allocator.free(file_z);
         try self.db.binlogOpen(file_z, pos);
         errdefer self.db.binlogClose();
