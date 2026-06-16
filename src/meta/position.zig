@@ -33,14 +33,21 @@ pub const SyncPosition = struct {
     stage: SyncStage = .full,
     updated_at: []const u8 = "",
     binlog_file: []const u8 = "",
-    binlog_pos: u64 = 0,
+    binlog_pos: i64 = 0,
 
     pub fn deinit(self: *SyncPosition, allocator: std.mem.Allocator) void {
         allocator.free(self.last_pk);
+        self.last_pk = "";
         allocator.free(self.last_update_time);
-        if (self.last_event_time) |e| allocator.free(e);
+        self.last_update_time = "";
+        if (self.last_event_time) |e| {
+            allocator.free(e);
+            self.last_event_time = null;
+        }
         allocator.free(self.updated_at);
+        self.updated_at = "";
         allocator.free(self.binlog_file);
+        self.binlog_file = "";
     }
 
     pub fn isInitial(self: *const SyncPosition) bool {
@@ -65,16 +72,18 @@ pub const Service = struct {
                 const binlog_file_s = row.get("binlog_file") orelse "";
                 const binlog_pos_s = row.get("binlog_pos") orelse "0";
 
-                return SyncPosition{
+                var pos = SyncPosition{
                     .task_id = try std.fmt.parseInt(i64, row.get("task_id") orelse "0", 10),
-                    .last_pk = try allocator.dupe(u8, last_pk_s),
-                    .last_update_time = try allocator.dupe(u8, last_ut_s),
-                    .last_event_time = if (last_et_s.len == 0) null else try allocator.dupe(u8, last_et_s),
-                    .stage = SyncStage.fromString(stage_s),
-                    .updated_at = try allocator.dupe(u8, updated_s),
-                    .binlog_file = try allocator.dupe(u8, binlog_file_s),
-                    .binlog_pos = std.fmt.parseInt(u64, binlog_pos_s, 10) catch 0,
                 };
+                errdefer pos.deinit(allocator);
+                pos.last_pk = try allocator.dupe(u8, last_pk_s);
+                pos.last_update_time = try allocator.dupe(u8, last_ut_s);
+                pos.last_event_time = if (last_et_s.len == 0) null else try allocator.dupe(u8, last_et_s);
+                pos.stage = SyncStage.fromString(stage_s);
+                pos.updated_at = try allocator.dupe(u8, updated_s);
+                pos.binlog_file = try allocator.dupe(u8, binlog_file_s);
+                pos.binlog_pos = std.fmt.parseInt(i64, binlog_pos_s, 10) catch 0;
+                return pos;
             }
         }
         return SyncPosition{ .task_id = task_id };
@@ -101,7 +110,7 @@ pub const Service = struct {
             event_param,
             .{ .text = pos.stage.toString() },
             .{ .text = pos.binlog_file },
-            .{ .int = @intCast(pos.binlog_pos) },
+            .{ .int = pos.binlog_pos },
         });
     }
 
@@ -110,3 +119,37 @@ pub const Service = struct {
         try store.db.execParams(sql, &.{.{ .int = task_id }});
     }
 };
+
+test "SyncPosition load/save roundtrip" {
+    const a = std.testing.allocator;
+    var store = try store_mod.MetaStore.init(a, ":memory:");
+    defer store.deinit();
+    try store.createAllTables();
+
+    var pos = SyncPosition{
+        .task_id = 1,
+        .last_pk = try a.dupe(u8, "100"),
+        .last_update_time = try a.dupe(u8, "2026-01-01 00:00:00"),
+        .binlog_file = try a.dupe(u8, "mysql-bin.000001"),
+        .binlog_pos = 1234,
+        .stage = .binlog,
+    };
+    defer pos.deinit(a);
+    try Service.save(&store, pos);
+
+    var loaded = try Service.load(&store, a, 1);
+    defer loaded.deinit(a);
+    try std.testing.expectEqualStrings("100", loaded.last_pk);
+    try std.testing.expectEqualStrings("mysql-bin.000001", loaded.binlog_file);
+    try std.testing.expectEqual(@as(i64, 1234), loaded.binlog_pos);
+    try std.testing.expectEqual(SyncStage.binlog, loaded.stage);
+}
+
+test "SyncPosition deinit is idempotent" {
+    const a = std.testing.allocator;
+    var pos = SyncPosition{ .task_id = 1 };
+    pos.deinit(a);
+    pos.deinit(a); // should not double-free
+    try std.testing.expectEqualStrings("", pos.last_pk);
+    try std.testing.expectEqual(@as(?[]const u8, null), pos.last_event_time);
+}

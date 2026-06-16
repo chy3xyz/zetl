@@ -100,6 +100,6 @@ CREATE TABLE IF NOT EXISTS sync_position (
   FOREIGN KEY (task_id) REFERENCES sync_task(id)
 );
 
--- 已部署数据库迁移语句 (SQLite)
-ALTER TABLE sync_position ADD COLUMN binlog_file TEXT NOT NULL DEFAULT '';
-ALTER TABLE sync_position ADD COLUMN binlog_pos INTEGER NOT NULL DEFAULT 0;
+-- 已部署数据库的列迁移由 src/meta/store.zig 自动处理 (V3 binlog CDC)
+-- ALTER TABLE sync_position ADD COLUMN binlog_file TEXT NOT NULL DEFAULT '';
+-- ALTER TABLE sync_position ADD COLUMN binlog_pos INTEGER NOT NULL DEFAULT 0;
