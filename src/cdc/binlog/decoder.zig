@@ -55,6 +55,7 @@ pub fn decodeColumn(
         0x0f => decodeVarchar(allocator, metadata, body, pos),
         0x0c => decodeDatetime(allocator, body, pos),
         0x12 => decodeDatetime2(allocator, metadata, body, pos),
+        0xf6 => decodeDecimal(allocator, metadata, body, pos),
         else => return error.UnsupportedType,
     };
 }
@@ -168,6 +169,144 @@ fn decodeDatetime2(allocator: std.mem.Allocator, metadata: []const u8, body: []c
     return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ year, month, day, hour, minute, second, microseconds }) catch return error.OutOfMemory;
 }
 
+// NEWDECIMAL (0xf6) — MySQL `decimal2bin` wire format.
+//
+// Each 9-digit "limb" is stored as a 4-byte big-endian unsigned integer.
+// Layout (per MySQL `strings/decimal.cc::decimal2bin`):
+//   * intg_size  = intg_limbs * 4 + dig2bytes[intg0_size]
+//   * frac_size  = frac_limbs * 4 + dig2bytes[frac0_size]
+//   * intg_limbs = intg_digits / 9,  intg0_size = intg_digits % 9
+//   * frac_limbs = scale / 9,        frac0_size = scale % 9
+//   * The compressed intg/frac limbs hold the leftover digit count as a
+//     big-endian unsigned integer in 1..4 bytes (dig2bytes).
+//   * Sign bit lives in byte 0 (positive → high bit set; negative → high bit
+//     clear + each limb's bytes XORed with 0xFF before the high-bit twiddle).
+//   * MySQL forces intg=1 even when precision == scale, so a "0." value still
+//     consumes 1 intg byte (value 0 + sign bit).
+const DIG_PER_DEC: usize = 9;
+const DIG_TO_BYTES = [10]u8{ 0, 1, 1, 2, 2, 3, 3, 4, 4, 4 };
+
+fn decodeDecimal(allocator: std.mem.Allocator, metadata: []const u8, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (metadata.len < 2) return error.InvalidValue;
+    const precision: usize = metadata[0];
+    const scale: usize = metadata[1];
+    if (precision == 0 or scale > precision) return error.InvalidValue;
+    const intg_digits = precision - scale;
+
+    // MySQL always emits at least 1 intg byte (value 0 + sign bit), even when
+    // the user-facing integer part is empty (precision == scale).
+    const effective_intg_digits: usize = if (intg_digits == 0) 1 else intg_digits;
+    const intg_limbs = effective_intg_digits / DIG_PER_DEC;
+    const intg0_size: usize = effective_intg_digits - intg_limbs * DIG_PER_DEC;
+    const intg_size: usize = intg_limbs * 4 + DIG_TO_BYTES[intg0_size];
+
+    const frac_limbs = scale / DIG_PER_DEC;
+    const frac0_size: usize = scale - frac_limbs * DIG_PER_DEC;
+    const frac_size: usize = frac_limbs * 4 + DIG_TO_BYTES[frac0_size];
+
+    const total_bytes = intg_size + frac_size;
+    if (body.len < pos.* + total_bytes) return error.BufferTooShort;
+
+    const is_negative = (body[pos.*] & 0x80) == 0;
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    if (is_negative) try out.append(allocator, '-');
+
+    var read_pos: usize = pos.*;
+
+    // Integer part: optional compressed intg0 limb, then intg_limbs full limbs.
+    // The compressed intg0 limb holds intg0_size digits as a 1..4-byte BE int.
+    // For full limbs each holds 9 digits. The sign bit is in byte 0 of the
+    // whole binary (which is the intg0 byte if intg0_size > 0, otherwise the
+    // first full intg limb's byte 0).
+    if (intg0_size > 0) {
+        var limb: u32 = 0;
+        const n_bytes: usize = DIG_TO_BYTES[intg0_size];
+        var i: usize = 0;
+        while (i < n_bytes) : (i += 1) {
+            var b = body[read_pos + i];
+            if (i == 0) b ^= 0x80; // strip sign bit
+            if (is_negative) b ^= 0xff;
+            limb = (limb << 8) | b;
+        }
+        try appendLimbDigits(&out, allocator, limb, intg0_size);
+        read_pos += n_bytes;
+    }
+    var limb_idx: usize = 0;
+    while (limb_idx < intg_limbs) : (limb_idx += 1) {
+        var limb: u32 = 0;
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            var b = body[read_pos + i];
+            // Sign bit only lives in byte 0 of the whole binary representation.
+            if (i == 0 and intg0_size == 0) b ^= 0x80;
+            if (is_negative) b ^= 0xff;
+            limb = (limb << 8) | b;
+        }
+        try appendLimbDigits(&out, allocator, limb, 9);
+        read_pos += 4;
+    }
+
+    // Decimal point between integer and fractional parts.
+    if (scale > 0) try out.append(allocator, '.');
+
+    // Fractional part: optional compressed frac0 limb, then frac_limbs full limbs.
+    // The sign bit never lives in frac bytes (it was already consumed above).
+    if (frac0_size > 0) {
+        var limb: u32 = 0;
+        const n_bytes: usize = DIG_TO_BYTES[frac0_size];
+        var i: usize = 0;
+        while (i < n_bytes) : (i += 1) {
+            var b = body[read_pos + i];
+            if (is_negative) b ^= 0xff;
+            limb = (limb << 8) | b;
+        }
+        try appendLimbDigits(&out, allocator, limb, frac0_size);
+        read_pos += n_bytes;
+    }
+    limb_idx = 0;
+    while (limb_idx < frac_limbs) : (limb_idx += 1) {
+        var limb: u32 = 0;
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            var b = body[read_pos + i];
+            if (is_negative) b ^= 0xff;
+            limb = (limb << 8) | b;
+        }
+        try appendLimbDigits(&out, allocator, limb, 9);
+        read_pos += 4;
+    }
+
+    pos.* = read_pos;
+    return out.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
+
+/// Append `n_digits` decimal digits of `value` to `out`, zero-padded on the
+/// left. Assumes `value < 10^n_digits` (caller's responsibility).
+fn appendLimbDigits(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u32, n_digits: usize) !void {
+    var buf: [10]u8 = undefined; // u32 fits in 10 decimal digits
+    var v = value;
+    var n: usize = 0;
+    if (v == 0) {
+        buf[0] = 0;
+        n = 1;
+    } else {
+        while (v > 0) : (v /= 10) {
+            buf[n] = @intCast(v % 10);
+            n += 1;
+        }
+    }
+    // Pad with leading zeros so we always emit exactly n_digits characters.
+    while (n < n_digits) : (n += 1) {
+        buf[n] = 0;
+    }
+    var i: usize = n;
+    while (i > 0) : (i -= 1) {
+        try out.append(allocator, '0' + buf[i - 1]);
+    }
+}
+
 test "decodeColumn for TINY returns decimal" {
     var pos: usize = 0;
     const buf = [_]u8{42};
@@ -275,4 +414,30 @@ test "decodeColumn for DATETIME2(0) emits no fraction" {
     const out = try decodeColumn(std.testing.allocator, 0x12, &meta, &buf, &pos);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("2026-06-15 12:34:56", out);
+}
+
+test "decodeColumn for NEWDECIMAL(3,2) decodes 1.00 from real wire bytes" {
+    var pos: usize = 0;
+    // MySQL wire bytes for DECIMAL(3,2) = 1.00: 0x81, 0x00
+    //   intg0 limb: 1 digit, stored as uint8 = 0x01, sign bit set -> 0x81
+    //   frac0 limb: 2 digits, stored as uint8 = 0x00
+    const buf = [_]u8{ 0x81, 0x00 };
+    const meta = [_]u8{ 3, 2 };
+    const out = try decodeColumn(std.testing.allocator, 0xf6, &meta, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("1.00", out);
+    try std.testing.expectEqual(@as(usize, 2), pos);
+}
+
+test "decodeColumn for NEWDECIMAL(5,2) decodes 123.45 from real wire bytes" {
+    var pos: usize = 0;
+    // MySQL wire bytes for DECIMAL(5,2) = 123.45: 0x80, 0x7B, 0x2D
+    //   intg0 limb: 3 digits, stored as uint16 BE = 0x007B, sign bit set -> 0x80 0x7B
+    //   frac0 limb: 2 digits, stored as uint8 = 0x2D (=45)
+    const buf = [_]u8{ 0x80, 0x7B, 0x2D };
+    const meta = [_]u8{ 5, 2 };
+    const out = try decodeColumn(std.testing.allocator, 0xf6, &meta, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("123.45", out);
+    try std.testing.expectEqual(@as(usize, 3), pos);
 }
