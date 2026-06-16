@@ -50,6 +50,8 @@ pub const MySqlSink = struct {
         self.flush() catch {};
         for (self.batch_buffer.items) |*row| row.deinit();
         self.batch_buffer.deinit(self.allocator);
+        self.allocator.free(self.target_table);
+        self.allocator.free(self.unique_key);
     }
 
     /// 追加单行 (达 batch_size 自动 flush)

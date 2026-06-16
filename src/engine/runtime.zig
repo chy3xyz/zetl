@@ -25,6 +25,8 @@ pub const SyncTask = struct {
     poller: cdc.poller.Poller,
     _sh: []u8, _sd: []u8, _su: []u8, _sp: []u8, // 持有 src DBConfig 的 dupe'd 字符串
     is_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// runLoop 退出后置 true, 供 stopAll 提前结束等待.
+    is_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 上次成功加载佣金规则的 Unix 时间 (秒). 0 = 从未成功加载过.
     /// 用于 stale-retry: 归集库恢复后, 每隔 rules_max_age_sec 再尝试拉一次.
     last_rules_loaded_at: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
@@ -36,11 +38,14 @@ pub const SyncTask = struct {
     pub fn init(a: std.mem.Allocator, cfg: RuntimeConfig, ds: meta.datasource.Datasource, store: *meta.store.MetaStore,
                sp: *zfinal.ConnectionPool, src_pool: *zfinal.ConnectionPool,
                src_host: []u8, src_db: []u8, src_user: []u8, src_pass: []u8) !SyncTask {
-        const mid = try a.dupe(u8, cfg.mall_id);
-        const tgt = try a.dupe(u8, cfg.target_table);
-        const fm: ?[]u8 = if (cfg.field_mappings_json) |f| try a.dupe(u8, f) else null;
-        const tr = try transform.engine.TransformEngine.init(a, .{.mall_id=mid,.source_type="mysql",.field_mappings_json=fm,.enable_commission_calc=cfg.enable_commission_calc});
-        const sk = sink_mod.mysql_sink.MySqlSink.init(a, sp, tgt, cfg.batch_size, "order_no");
+        // TransformEngine / MySqlSink 会在内部复制需要的字符串, 这里直接传借用值.
+        const tr = try transform.engine.TransformEngine.init(a, .{
+            .mall_id = cfg.mall_id,
+            .source_type = "mysql",
+            .field_mappings_json = cfg.field_mappings_json,
+            .enable_commission_calc = cfg.enable_commission_calc,
+        });
+        const sk = sink_mod.mysql_sink.MySqlSink.init(a, sp, cfg.target_table, cfg.batch_size, "order_no");
         const po = try meta.position.Service.load(store, a, cfg.task_id);
         const pl_cfg = cdc.poller.PollerConfig.fromSlices(src_host, ds.port, src_user, src_pass, src_db, cfg.source_table, cfg.pk_column, cfg.update_time_column, @intCast(cfg.batch_size));
         const pl = cdc.poller.Poller.init(a, pl_cfg, src_pool);
@@ -50,7 +55,8 @@ pub const SyncTask = struct {
 
     pub fn deinit(self: *SyncTask) void {
         self.transformer.deinit(); self.sink.deinit();
-        self.src_pool.deinit(); self.allocator.destroy(self.src_pool);
+        // src_pool 由 ConnectionPool.init 在内部 self-destroy, 外部只需 deinit.
+        self.src_pool.deinit();
         self.allocator.free(self._sh); self.allocator.free(self._sd);
         self.allocator.free(self._su); self.allocator.free(self._sp);
         self.pos.deinit(self.allocator);
@@ -70,7 +76,10 @@ pub const SyncTask = struct {
 
     fn runLoop(self: *SyncTask) void {
         common.logger.inf("[task {d}] 启动 stage={s}", .{self.cfg.task_id, self.pos.stage.toString()});
-        defer common.logger.inf("[task {d}] 退出", .{self.cfg.task_id});
+        defer {
+            common.logger.inf("[task {d}] 退出", .{self.cfg.task_id});
+            self.is_finished.store(true, .release);
+        }
 
         // 启动时 / 全量后尝试加载佣金规则; enable_commission_calc 为 true 才需要.
         // 归集库不可达时 loadRules 内部已优雅降级 (打 warn + 空规则), 不抛 error.

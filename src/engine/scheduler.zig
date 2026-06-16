@@ -194,11 +194,21 @@ pub const Scheduler = struct {
 
         common.logger.inf("[graceful] 已向 {d} 个任务发送停止信号, 等待 {d}ms", .{count, timeout_ms});
 
-        // 3. 软等待 - 简单 sleep 到 deadline. worker 线程在 is_running 变 false 后
-        //    会在当前 batch 跑完后跳出 runFull 的 while 循环, 之后 runLoop 退出, 线程自然结束.
+        // 3. 软等待 - 轮询任务 is_finished, 全部完成后提前返回; 否则睡到 deadline.
         const start_ms: i64 = nowMs();
         while (nowMs() - start_ms < @as(i64, @intCast(timeout_ms))) {
             std.Io.sleep(io, .fromMilliseconds(100), .real) catch break;
+            self.mutex.lock(io) catch continue;
+            var all_done = true;
+            var it2 = self.tasks.iterator();
+            while (it2.next()) |entry| {
+                if (!entry.value_ptr.*.is_finished.load(.acquire)) {
+                    all_done = false;
+                    break;
+                }
+            }
+            self.mutex.unlock(io);
+            if (all_done) break;
         }
 
         return count;

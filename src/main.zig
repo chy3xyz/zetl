@@ -21,12 +21,9 @@ pub fn main(init: std.process.Init) !void {
     zfinal.io_instance.init(init);
     const allocator = init.gpa;
 
-    // 0. P1 任务 1.8: 优雅停机 — 已通过 zfinal.shutdown.registerHandlers() 注册
-    //    SIGINT/SIGTERM handler, 置位 atomic flag, server.acceptLoop 下个迭代时退出
-    //    临时禁用: zfinal v0.10.6 server.zig:111 的 group.cancel(io) 在 group 仍有
-    //    awaiter 时会触发 assert(!pre_cancel_status.have_awaiter) panic, 导致进程
-    //    崩溃. 等待 zfinal 修复后再启用.
-    // zfinal.shutdown.registerHandlers();
+    // 0. P1 任务 1.8: 优雅停机 — zfinal v0.10.7 已修复 server.zig group.cancel panic,
+    //    重新启用 SIGINT/SIGTERM handler.
+    zfinal.shutdown.registerHandlers();
 
     // 1. 加载配置
     var cfg = try config_mod.loadConfig(allocator, "config.toml");
@@ -41,6 +38,7 @@ pub fn main(init: std.process.Init) !void {
 
     // 4. 初始化归集库连接池
     const sink_pool = try web.deps_mod.initSinkPool(allocator, cfg);
+    defer sink_pool.deinit();
 
     // 5. 初始化全局 token
     var token_mgr = try allocator.create(zfinal.TokenManager);
@@ -87,7 +85,9 @@ pub fn main(init: std.process.Init) !void {
         common.logger.warn("收到停机信号, 正在停止调度器...", .{});
         // 软等待 30s 让运行中 task 跑完当前 batch
         const stopped = scheduler.stopAll(30_000);
-        common.logger.inf("已停止 {d} 个任务, 退出", .{stopped});
+        common.logger.inf("已停止 {d} 个任务", .{stopped});
+        // 释放 task 占用的连接池与字符串, 避免 SafeAllocator 泄漏报告
+        scheduler.deinit();
     }
 }
 

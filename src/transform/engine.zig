@@ -55,7 +55,16 @@ pub const TransformEngine = struct {
             mapper_mod.Mapper{ .allocator = allocator };
         return .{
             .allocator = allocator,
-            .cfg = cfg,
+            .cfg = .{
+                .mall_id = try allocator.dupe(u8, cfg.mall_id),
+                .source_type = try allocator.dupe(u8, cfg.source_type),
+                .field_mappings_json = if (cfg.field_mappings_json) |fm| try allocator.dupe(u8, fm) else null,
+                .filter_condition = if (cfg.filter_condition) |f| try allocator.dupe(u8, f) else null,
+                .enable_commission_calc = cfg.enable_commission_calc,
+                .filter_field = if (cfg.filter_field) |f| try allocator.dupe(u8, f) else null,
+                .filter_op = cfg.filter_op,
+                .filter_value = if (cfg.filter_value) |v| try allocator.dupe(u8, v) else null,
+            },
             .mapper = mapper,
             .calculator = commission_mod.Calculator.init(allocator),
         };
@@ -64,6 +73,12 @@ pub const TransformEngine = struct {
     pub fn deinit(self: *TransformEngine) void {
         self.mapper.deinit();
         self.calculator.deinit();
+        self.allocator.free(self.cfg.mall_id);
+        self.allocator.free(self.cfg.source_type);
+        if (self.cfg.field_mappings_json) |fm| self.allocator.free(fm);
+        if (self.cfg.filter_condition) |f| self.allocator.free(f);
+        if (self.cfg.filter_field) |f| self.allocator.free(f);
+        if (self.cfg.filter_value) |v| self.allocator.free(v);
     }
 
     /// 设置佣金计算器规则
