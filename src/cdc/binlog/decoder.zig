@@ -61,6 +61,8 @@ pub fn decodeColumn(
         0xfc, 0xfd, 0xf5 => decodeBlobLike(allocator, metadata, body, pos),
         0x07 => decodeTimestamp(allocator, body, pos),
         0x11 => decodeTimestamp2(allocator, metadata, body, pos),
+        0x0b => decodeTime(allocator, body, pos),
+        0x13 => decodeTime2(allocator, metadata, body, pos),
         else => return error.UnsupportedType,
     };
 }
@@ -384,6 +386,62 @@ fn civilFromDays(z: i64) struct { y: i64, m: u32, d: u32 } {
     return .{ .y = year, .m = m, .d = d };
 }
 
+fn decodeTime(allocator: std.mem.Allocator, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (body.len < pos.* + 3) return error.BufferTooShort;
+    const raw: u32 = (@as(u32, body[pos.*]) << 16) |
+        (@as(u32, body[pos.* + 1]) << 8) |
+        @as(u32, body[pos.* + 2]);
+    pos.* += 3;
+    const is_negative = (raw & 0x800000) != 0;
+    const abs: u32 = if (is_negative) ((~raw + 1) & 0x7fffff) else raw;
+    const hour: u32 = (abs >> 12) & 0x3ff;
+    const minute: u32 = (abs >> 6) & 0x3f;
+    const second: u32 = abs & 0x3f;
+    if (is_negative) {
+        return std.fmt.allocPrint(allocator, "-{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }) catch return error.OutOfMemory;
+    }
+    return std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }) catch return error.OutOfMemory;
+}
+
+fn decodeTime2(allocator: std.mem.Allocator, metadata: []const u8, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (metadata.len < 1) return error.InvalidValue;
+    const fsp: u8 = metadata[0];
+    if (fsp > 6) return error.InvalidValue;
+    const frac_bytes: usize = @intCast(@divFloor(fsp + 1, 2));
+    if (body.len < pos.* + 3 + frac_bytes) return error.BufferTooShort;
+
+    const raw: u32 = (@as(u32, body[pos.*]) << 16) |
+        (@as(u32, body[pos.* + 1]) << 8) |
+        @as(u32, body[pos.* + 2]);
+    pos.* += 3;
+
+    var frac_int: u64 = 0;
+    var i: usize = 0;
+    while (i < frac_bytes) : (i += 1) {
+        frac_int = (frac_int << 8) | body[pos.* + i];
+    }
+    pos.* += frac_bytes;
+    const shift: u6 = @intCast((3 - frac_bytes) * 8);
+    const microseconds: u64 = frac_int << shift;
+
+    const is_negative = (raw & 0x800000) != 0;
+    const abs: u32 = if (is_negative) ((~raw + 1) & 0x7fffff) else raw;
+    const hour: u32 = (abs >> 12) & 0x3ff;
+    const minute: u32 = (abs >> 6) & 0x3f;
+    const second: u32 = abs & 0x3f;
+
+    if (fsp == 0) {
+        if (is_negative) {
+            return std.fmt.allocPrint(allocator, "-{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }) catch return error.OutOfMemory;
+        }
+        return std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }) catch return error.OutOfMemory;
+    }
+    if (is_negative) {
+        return std.fmt.allocPrint(allocator, "-{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ hour, minute, second, microseconds }) catch return error.OutOfMemory;
+    }
+    return std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ hour, minute, second, microseconds }) catch return error.OutOfMemory;
+}
+
 fn decodeTimestamp(allocator: std.mem.Allocator, body: []const u8, pos: *usize) DecodeError![]const u8 {
     if (body.len < pos.* + 4) return error.BufferTooShort;
     const v = std.mem.readInt(u32, body[pos.*..][0..4], .big);
@@ -695,4 +753,37 @@ test "decodeColumn for TIMESTAMP2(6) reads 5-byte packed datetime with microseco
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("2026-06-15 12:34:56.123456", out);
     try std.testing.expectEqual(@as(usize, 8), pos);
+}
+
+test "decodeColumn for TIME reads 3-byte packed duration" {
+    var pos: usize = 0;
+    // 12:34:56 -> 0x12 bf f0
+    // packed = (hour << 12) | (minute << 6) | second
+    const val: u32 = (12 << 12) | (34 << 6) | 56;
+    var buf: [3]u8 = undefined;
+    buf[0] = @intCast((val >> 16) & 0xff);
+    buf[1] = @intCast((val >> 8) & 0xff);
+    buf[2] = @intCast(val & 0xff);
+    const out = try decodeColumn(std.testing.allocator, 0x0b, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("12:34:56", out);
+    try std.testing.expectEqual(@as(usize, 3), pos);
+}
+
+test "decodeColumn for TIME2(6) reads 3+3-byte packed duration with microseconds" {
+    var pos: usize = 0;
+    // 12:34:56.123456
+    const val: u32 = (12 << 12) | (34 << 6) | 56;
+    var buf: [6]u8 = undefined;
+    buf[0] = @intCast((val >> 16) & 0xff);
+    buf[1] = @intCast((val >> 8) & 0xff);
+    buf[2] = @intCast(val & 0xff);
+    buf[3] = 0x01;
+    buf[4] = 0xe2;
+    buf[5] = 0x40;
+    const meta = [_]u8{6};
+    const out = try decodeColumn(std.testing.allocator, 0x13, &meta, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("12:34:56.123456", out);
+    try std.testing.expectEqual(@as(usize, 6), pos);
 }
