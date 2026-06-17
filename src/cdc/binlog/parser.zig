@@ -5,29 +5,37 @@
 //!                   WRITE_ROWS_EVENT_V2 (生成 RowEvent 列表).
 //! 阶段 2 (Task 3): DELETE_ROWS_EVENT_V2 解析 (before image).
 //! 阶段 2 (Task 4): UPDATE_ROWS_EVENT_V2 解析 (before/after 双镜像).
-//! 阶段 3 (后续): 更多 MySQL 字段类型解码.
+//! 阶段 2b: 扩展 decoder.zig, 新增 DATETIME / DATETIME2 / NEWDECIMAL /
+//!         BLOB / TEXT / JSON / VARCHAR>255 解码.
 //!
 //! ## 支持的 MySQL 字段类型
-//! - INTEGER 家族 (统一按无符号小端读取, 输出十进制字符串):
+//! - INTEGER 家族 (按有符号小端读取, 输出十进制字符串; 负值带 `-` 前缀):
 //!     TINYINT (0x01, 1B), SHORT (0x02, 2B), INT24 (0x09, 3B),
 //!     LONG (0x03, 4B), LONGLONG (0x08, 8B)
-//! - VARCHAR (0x0f): max_bytes ≤ 255 时按 1 字节长度 + N 字节数据解码.
+//! - VARCHAR (0x0f): 当 metadata 中的 max_length ≤ 255 时读 1 字节长度,
+//!     否则读 2 字节长度, 然后读 N 字节数据 (Phase 2b 新增 >255 路径).
+//! - DATETIME (0x0c): 8 字节 packed datetime → `YYYY-MM-DD HH:MM:SS`.
+//! - DATETIME2 (0x12): 5 字节 packed datetime + fsp 字节小数 (1..3 字节).
+//! - NEWDECIMAL (0xf6): 按 `decimal2bin` wire format 解码, 支持负数.
+//! - BLOB 变种 (0xfc) / TEXT (0xfd) / JSON (0xf5): 按 metadata 的
+//!     pack_length (1/2/3/4) 读前缀长度, 然后读 N 字节原始数据.
 //!
-//! ## 不支持的类型 (占位 0 字节, 字段值固定为字符串 "TODO")
-//! FLOAT / DOUBLE / DATE / TIME / DATETIME / TIMESTAMP / BLOB / TEXT /
-//! JSON / DECIMAL / BIT / ENUM / SET / 几何类型 / 等.
-//! 后续 Task 添加解码 (Task 9c).
+//! ## 不支持的类型 (返回 error.UnsupportedType)
+//! FLOAT / DOUBLE / DATE / TIME / TIMESTAMP / BIT / ENUM / SET / 几何类型 / YEAR /
+//! OLD DECIMAL 等. 这些列在 TABLE_MAP 中识别到但 decodeColumn 拒绝并向上抛错.
 //!
 //! ## 限制
 //! - 仅支持 ROWS_EVENT v2 (MySQL 5.6+ 默认); v1 (0x17) 未实现
 //! - WRITE/UPDATE/DELETE_ROWS_EVENT_V2 已解析
 //! - 列名固定为 `c0`, `c1`, ... (binlog 流不含列名, 需外部 transform 映射)
 //! - 假定 binlog_row_image=FULL (binlog 含所有列, used_bitmap 全 1)
-//! - column_metadata 暂不解析 (后续支持 VARCHAR>255/CHAR 时按类型步进)
+//! - column_metadata 按列类型步进解析; 缓冲不足时 metadataForColumn 返回空切片,
+//!     decoder 会进一步返回 error.InvalidValue, 不会越界访问.
 
 const std = @import("std");
 const event_mod = @import("../event.zig");
 const position_mod = @import("position.zig");
+const decoder = @import("decoder.zig");
 
 pub const EventType = enum(u8) {
     rotate = 0x04,
@@ -68,6 +76,29 @@ pub const TableMap = struct {
         allocator.free(self.null_bitmap);
         self.* = undefined;
     }
+
+    /// 返回指定 MySQL 列类型在 column_metadata 中占用的字节数.
+    /// 委托给 decoder 模块, 保持 metadata 解析逻辑集中.
+    pub fn metadataLengthForType(col_type: u8) usize {
+        return decoder.metadataLengthForType(col_type);
+    }
+
+    /// 返回 column `col_idx` 在 column_metadata 中对应的切片.
+    /// 通过累加前面所有列的 metadata 长度计算偏移, 然后按本列长度切片.
+    /// 当 metadata 缓冲比预期短时返回空切片 (调用方按需返回 error.InvalidValue),
+    /// 这样即使上游 parseTableMap 的 metadata_length 字段被截断 / 不一致,
+    /// 也不会越界访问, 也不会抛出未定义行为.
+    pub fn metadataForColumn(self: TableMap, col_idx: usize) []const u8 {
+        var offset: usize = 0;
+        for (self.column_types[0..col_idx]) |t| {
+            offset += decoder.metadataLengthForType(t);
+        }
+        const len = decoder.metadataLengthForType(self.column_types[col_idx]);
+        if (offset + len > self.column_metadata.len) {
+            return &[_]u8{};
+        }
+        return self.column_metadata[offset..][0..len];
+    }
 };
 
 pub const ParsedEvent = union(enum) {
@@ -88,6 +119,9 @@ pub const ParseError = error{
     InvalidEvent,
     OutOfMemory,
     UnknownTableId,
+    // decoder 模块的 DecodeError 透传: row event 解码时类型不识别 / 字段值非法
+    InvalidValue,
+    UnsupportedType,
 };
 
 // ============================================================================
@@ -390,15 +424,25 @@ pub const Parser = struct {
         for (used_columns, 0..) |col_idx, used_idx| {
             if (isBitSet(null_bitmap, used_idx)) continue; // NULL 跳过
 
-            const col_type = tm.column_types[col_idx];
-            const value = try readColumnValue(self.allocator, col_type, body, pos);
+            const value = try self.readColumnValue(tm, col_idx, body, pos);
             errdefer self.allocator.free(value);
-
             const col_name = try std.fmt.allocPrint(self.allocator, "c{d}", .{col_idx});
             errdefer self.allocator.free(col_name);
-
             try target.put(col_name, value);
         }
+    }
+
+    /// 通过 decoder 模块解码单个字段值.
+    fn readColumnValue(
+        self: *Parser,
+        tm: TableMap,
+        col_idx: usize,
+        body: []const u8,
+        pos: *usize,
+    ) ParseError![]const u8 {
+        const col_type = tm.column_types[col_idx];
+        const meta = tm.metadataForColumn(col_idx);
+        return try decoder.decodeColumn(self.allocator, col_type, meta, body, pos);
     }
 };
 
@@ -533,58 +577,6 @@ fn readInt24(buf: []const u8) u32 {
 
 fn isBitSet(bitmap: []const u8, bit: usize) bool {
     return (bitmap[bit / 8] & (@as(u8, 1) << @intCast(bit % 8))) != 0;
-}
-
-/// 解码单个 MySQL 字段值, 返回堆分配的字符串.
-/// 已知类型: 1/2/3/4/8 字节整数 (无符号小端, 输出十进制字符串) +
-///           VARCHAR≤255 (1 字节长度 + N 字节).
-/// 其他类型: 占位 0 字节, 返回 "TODO" 标记.
-fn readColumnValue(allocator: std.mem.Allocator, col_type: u8, body: []const u8, pos: *usize) (ParseError || std.mem.Allocator.Error)![]const u8 {
-    switch (col_type) {
-        0x01 => { // MYSQL_TYPE_TINY (1B)
-            if (body.len < pos.* + 1) return error.BufferTooShort;
-            const v = body[pos.*];
-            pos.* += 1;
-            return std.fmt.allocPrint(allocator, "{d}", .{v});
-        },
-        0x02 => { // MYSQL_TYPE_SHORT (2B)
-            if (body.len < pos.* + 2) return error.BufferTooShort;
-            const v = std.mem.readInt(u16, body[pos.*..][0..2], .little);
-            pos.* += 2;
-            return std.fmt.allocPrint(allocator, "{d}", .{v});
-        },
-        0x09 => { // MYSQL_TYPE_INT24 (3B)
-            if (body.len < pos.* + 3) return error.BufferTooShort;
-            const v = readInt24(body[pos.*..][0..3]);
-            pos.* += 3;
-            return std.fmt.allocPrint(allocator, "{d}", .{v});
-        },
-        0x03 => { // MYSQL_TYPE_LONG (4B)
-            if (body.len < pos.* + 4) return error.BufferTooShort;
-            const v = std.mem.readInt(u32, body[pos.*..][0..4], .little);
-            pos.* += 4;
-            return std.fmt.allocPrint(allocator, "{d}", .{v});
-        },
-        0x08 => { // MYSQL_TYPE_LONGLONG (8B)
-            if (body.len < pos.* + 8) return error.BufferTooShort;
-            const v = std.mem.readInt(u64, body[pos.*..][0..8], .little);
-            pos.* += 8;
-            return std.fmt.allocPrint(allocator, "{d}", .{v});
-        },
-        0x0f => { // MYSQL_TYPE_VARCHAR (max_bytes ≤ 255: 1B len + N bytes)
-            if (body.len < pos.* + 1) return error.BufferTooShort;
-            const str_len: usize = body[pos.*];
-            pos.* += 1;
-            if (body.len < pos.* + str_len) return error.BufferTooShort;
-            const value = try allocator.dupe(u8, body[pos.*..][0..str_len]);
-            pos.* += str_len;
-            return value;
-        },
-        else => {
-            // TODO: 未实现的字段类型. 当前不读字节, 字段值标记为 "TODO".
-            return allocator.dupe(u8, "TODO");
-        },
-    }
 }
 
 // ============================================================================
@@ -803,14 +795,14 @@ test "Parser parses WRITE_ROWS_V2 with VARCHAR and LONGLONG columns" {
     // TABLE_MAP: 3 cols [LONGLONG, VARCHAR, INT24], db="mydb", tbl="tbl"
     //   body = table_id(6) + db_len(1) + "mydb"(4) + NUL(1) +
     //          tbl_len(1) + "tbl"(3) + NUL(1) + col_count(1) + col_types(3) +
-    //          meta_len(1) + meta(0) + null_bitmap(1)
-    //   = 6+1+4+1+1+3+1+1+3+1+0+1 = 23. event_size = 19 + 23 + 4 = 46.
-    var tm_buf: [46]u8 = undefined;
+    //          meta_len(1) + meta(2, for VARCHAR max_length) + null_bitmap(1)
+    //   = 6+1+4+1+1+3+1+1+3+1+2+1 = 25. event_size = 19 + 25 + 4 = 48.
+    var tm_buf: [48]u8 = undefined;
     @memset(&tm_buf, 0);
     std.mem.writeInt(u32, tm_buf[0..4], 0, .little);
     tm_buf[4] = 0x13;
     std.mem.writeInt(u32, tm_buf[5..9], 1, .little);
-    std.mem.writeInt(u32, tm_buf[9..13], 46, .little);
+    std.mem.writeInt(u32, tm_buf[9..13], 48, .little);
     std.mem.writeInt(u32, tm_buf[13..17], 0, .little);
     std.mem.writeInt(u16, tm_buf[17..19], 0, .little);
     std.mem.writeInt(u48, tm_buf[19..25], 0x10, .little); // table_id
@@ -824,9 +816,11 @@ test "Parser parses WRITE_ROWS_V2 with VARCHAR and LONGLONG columns" {
     tm_buf[37] = 0x08; // LONGLONG
     tm_buf[38] = 0x0f; // VARCHAR
     tm_buf[39] = 0x09; // INT24
-    tm_buf[40] = 0; // meta_len = 0
-    tm_buf[41] = 0; // null_bitmap (1 byte, no NULL)
-    // bytes 42..45 为 CRC (已清零)
+    tm_buf[40] = 2; // meta_len = 2 (VARCHAR max_length)
+    tm_buf[41] = 0xff; // VARCHAR max_length low byte = 255
+    tm_buf[42] = 0x00; // VARCHAR max_length high byte
+    tm_buf[43] = 0; // null_bitmap (1 byte, no NULL)
+    // bytes 44..47 为 CRC (已清零)
     _ = try p.processEvent(&tm_buf);
 
     // WRITE_ROWS_V2: 1 行, 3 列 = [12345, "hi", 0x123456]
@@ -899,13 +893,16 @@ test "Parser parses UPDATE_ROWS_V2 with before and after images" {
     var p = Parser.init(a);
     defer p.deinit();
 
-    // TABLE_MAP: 2 cols [TINYINT, VARCHAR], db="db", tbl="t", body=18, event_size=41
+    // TABLE_MAP: 2 cols [TINYINT, VARCHAR], db="db", tbl="t"
+    //   body = table_id(6) + db_len(1) + "db"(2) + NUL(1) + tbl_len(1) + "t"(1) + NUL(1) +
+    //          col_count(1) + col_types(2) + meta_len(1) + meta(2, VARCHAR max_length) + null_bitmap(1) = 20
+    //   event_size = 19 + 20 + 4 = 43
     var tm_buf: [80]u8 = undefined;
     @memset(&tm_buf, 0);
     std.mem.writeInt(u32, tm_buf[0..4], 0, .little);
     tm_buf[4] = 0x13;
     std.mem.writeInt(u32, tm_buf[5..9], 1, .little);
-    std.mem.writeInt(u32, tm_buf[9..13], 41, .little);
+    std.mem.writeInt(u32, tm_buf[9..13], 43, .little);
     std.mem.writeInt(u32, tm_buf[13..17], 0, .little);
     std.mem.writeInt(u16, tm_buf[17..19], 0, .little);
     var tpos: usize = 19;
@@ -929,9 +926,13 @@ test "Parser parses UPDATE_ROWS_V2 with before and after images" {
     tpos += 1;
     tm_buf[tpos] = 0x0f;
     tpos += 1;
-    tm_buf[tpos] = 0;
+    tm_buf[tpos] = 2; // meta_len = 2 (VARCHAR max_length)
     tpos += 1;
-    tm_buf[tpos] = 0;
+    tm_buf[tpos] = 0xff; // VARCHAR max_length low byte = 255
+    tpos += 1;
+    tm_buf[tpos] = 0x00; // VARCHAR max_length high byte
+    tpos += 1;
+    tm_buf[tpos] = 0; // null_bitmap (1 byte, no NULL)
     tpos += 1;
     _ = try p.processEvent(&tm_buf);
 
@@ -1018,12 +1019,15 @@ test "Parser parses DELETE_ROWS_V2 with before_fields" {
     defer p.deinit();
 
     // TABLE_MAP: 2 cols [TINYINT, VARCHAR], db="db", tbl="t"
+    //   body = table_id(6) + db_len(1) + "db"(2) + NUL(1) + tbl_len(1) + "t"(1) + NUL(1) +
+    //          col_count(1) + col_types(2) + meta_len(1) + meta(2, VARCHAR max_length) + null_bitmap(1) = 20
+    //   event_size = 19 + 20 + 4 = 43
     var tm_buf: [80]u8 = undefined;
     @memset(&tm_buf, 0);
     std.mem.writeInt(u32, tm_buf[0..4], 0, .little);
     tm_buf[4] = 0x13;
     std.mem.writeInt(u32, tm_buf[5..9], 1, .little);
-    std.mem.writeInt(u32, tm_buf[9..13], 41, .little); // 19 + 18 body + 4 CRC
+    std.mem.writeInt(u32, tm_buf[9..13], 43, .little);
     std.mem.writeInt(u32, tm_buf[13..17], 0, .little);
     std.mem.writeInt(u16, tm_buf[17..19], 0, .little);
     var tpos: usize = 19;
@@ -1047,8 +1051,12 @@ test "Parser parses DELETE_ROWS_V2 with before_fields" {
     tpos += 1; // TINYINT
     tm_buf[tpos] = 0x0f;
     tpos += 1; // VARCHAR
-    tm_buf[tpos] = 0;
-    tpos += 1; // meta_len
+    tm_buf[tpos] = 2;
+    tpos += 1; // meta_len = 2 (VARCHAR max_length)
+    tm_buf[tpos] = 0xff;
+    tpos += 1; // VARCHAR max_length low byte = 255
+    tm_buf[tpos] = 0x00;
+    tpos += 1; // VARCHAR max_length high byte
     tm_buf[tpos] = 0;
     tpos += 1; // null_bitmap
     _ = try p.processEvent(&tm_buf);
@@ -1136,4 +1144,133 @@ test "processEvent strips 4-byte binlog checksum from WRITE_ROWS_V2" {
     try std.testing.expect(ev == .row);
     try std.testing.expectEqual(@as(usize, 1), ev.row.len);
     try std.testing.expectEqualStrings("42", ev.row[0].getField("c0").?);
+}
+
+test "TableMap.metadataForColumn returns correct per-column slice" {
+    // types: [TINYINT=0x01, VARCHAR=0x0f, INT24=0x09]
+    // metadata: ["", "\x00\x05" (VARCHAR max_length=5), ""]
+    const tm = TableMap{
+        .table_id = 0,
+        .database = "",
+        .table = "",
+        .column_types = &.{ 0x01, 0x0f, 0x09 },
+        .column_metadata = "\x00\x05",
+        .null_bitmap = "",
+    };
+    try std.testing.expectEqualStrings("", tm.metadataForColumn(0));
+    try std.testing.expectEqualStrings("\x00\x05", tm.metadataForColumn(1));
+    try std.testing.expectEqualStrings("", tm.metadataForColumn(2));
+}
+
+test "Parser parses WRITE_ROWS_V2 with DATETIME/DECIMAL/BLOB/JSON columns" {
+    const a = std.testing.allocator;
+    var p = Parser.init(a);
+    defer p.deinit();
+
+    // TABLE_MAP: 4 cols [DATETIME, NEWDECIMAL(3,2), BLOB pack=1, JSON pack=4]
+    //   body = table_id(6) + db_len(1) + "db"(2) + NUL(1) +
+    //          tbl_len(1) + "t"(1) + NUL(1) +
+    //          col_count(1) + col_types(4) +
+    //          meta_len(1) + meta(4) +
+    //          null_bitmap(1)
+    //   = 6+1+2+1+1+1+1+1+4+1+4+1 = 24. event_size = 19 + 24 + 4 = 47.
+    var tm_buf: [80]u8 = undefined;
+    @memset(&tm_buf, 0);
+    std.mem.writeInt(u32, tm_buf[0..4], 0, .little);
+    tm_buf[4] = 0x13; // TABLE_MAP
+    std.mem.writeInt(u32, tm_buf[5..9], 1, .little);
+    std.mem.writeInt(u32, tm_buf[13..17], 0, .little);
+    std.mem.writeInt(u16, tm_buf[17..19], 0, .little);
+    var tpos: usize = 19;
+    std.mem.writeInt(u48, tm_buf[tpos..][0..6], 0x42, .little);
+    tpos += 6;
+    tm_buf[tpos] = 2;
+    tpos += 1; // db_len
+    @memcpy(tm_buf[tpos..][0..2], "db");
+    tpos += 2;
+    tm_buf[tpos] = 0;
+    tpos += 1; // db NUL
+    tm_buf[tpos] = 1;
+    tpos += 1; // tbl_len
+    @memcpy(tm_buf[tpos..][0..1], "t");
+    tpos += 1;
+    tm_buf[tpos] = 0;
+    tpos += 1; // tbl NUL
+    tm_buf[tpos] = 4;
+    tpos += 1; // col_count (packed-int byte)
+    tm_buf[tpos] = 0x0c;
+    tpos += 1; // DATETIME
+    tm_buf[tpos] = 0xf6;
+    tpos += 1; // NEWDECIMAL
+    tm_buf[tpos] = 0xfc;
+    tpos += 1; // BLOB
+    tm_buf[tpos] = 0xf5;
+    tpos += 1; // JSON
+    tm_buf[tpos] = 4;
+    tpos += 1; // meta_len (packed-int byte = 4 bytes of metadata)
+    tm_buf[tpos] = 3;
+    tpos += 1; // NEWDECIMAL precision
+    tm_buf[tpos] = 2;
+    tpos += 1; // NEWDECIMAL scale
+    tm_buf[tpos] = 1;
+    tpos += 1; // BLOB pack_length
+    tm_buf[tpos] = 4;
+    tpos += 1; // JSON pack_length
+    tm_buf[tpos] = 0;
+    tpos += 1; // null_bitmap (4 cols ≤ 8 → 1 byte)
+    std.mem.writeInt(u32, tm_buf[9..13], @intCast(tpos + 4), .little); // +4 for CRC
+    _ = try p.processEvent(&tm_buf);
+
+    // WRITE_ROWS_V2: 1 row, 4 cols.
+    //   body = post-header(10) + col_count(1) + used_bitmap(1) + num_rows(1) +
+    //          null_bitmap(1) +
+    //          DATETIME(8) + DECIMAL(2) + BLOB(1+5) + JSON(4+1)
+    //   = 10 + 4 + 21 = 35. event_size = 19 + 35 + 4 = 58.
+    var wr_buf: [80]u8 = undefined;
+    @memset(&wr_buf, 0);
+    std.mem.writeInt(u32, wr_buf[0..4], 0, .little);
+    wr_buf[4] = 0x1e; // WRITE_ROWS_V2
+    std.mem.writeInt(u32, wr_buf[5..9], 1, .little);
+    std.mem.writeInt(u32, wr_buf[9..13], 58, .little); // event_size
+    std.mem.writeInt(u32, wr_buf[13..17], 0, .little);
+    std.mem.writeInt(u16, wr_buf[17..19], 0, .little);
+    // body
+    std.mem.writeInt(u48, wr_buf[19..25], 0x42, .little); // table_id
+    // flags (2) + extra_data_len (2) 默认 memset 为 0
+    wr_buf[29] = 4; // col_count
+    wr_buf[30] = 0x0f; // used_bitmap: cols 0..3 used
+    wr_buf[31] = 1; // num_rows
+    wr_buf[32] = 0x00; // null_bitmap (no NULL)
+    // DATETIME: 2026-06-15 12:34:56
+    const date_int: u64 = 15 + 6 * 32 + 2026 * 16 * 32;
+    const time_int: u64 = 56 + 34 * 64 + 12 * 64 * 64;
+    std.mem.writeInt(u64, wr_buf[33..41], (date_int << 32) | time_int, .little);
+    // DECIMAL(3,2) = 1.00: byte 0x81 (1 with sign bit), 0x00 (frac=00)
+    wr_buf[41] = 0x81;
+    wr_buf[42] = 0x00;
+    // BLOB pack=1: len=5 + "hello"
+    wr_buf[43] = 5;
+    @memcpy(wr_buf[44..][0..5], "hello");
+    // JSON pack=4: len=1 + "{"
+    wr_buf[49] = 1;
+    wr_buf[50] = 0;
+    wr_buf[51] = 0;
+    wr_buf[52] = 0;
+    wr_buf[53] = '{';
+    // bytes 54..57 为 CRC (已清零)
+
+    var ev = try p.processEvent(&wr_buf);
+    defer freeRowEvents(a, ev.row);
+
+    try std.testing.expect(ev == .row);
+    try std.testing.expectEqual(@as(usize, 1), ev.row.len);
+    const row = &ev.row[0];
+    try std.testing.expectEqual(event_mod.RowOp.insert, row.op);
+    try std.testing.expectEqualStrings("db", row.database);
+    try std.testing.expectEqualStrings("t", row.table);
+    try std.testing.expectEqual(@as(usize, 4), row.fields.count());
+    try std.testing.expectEqualStrings("2026-06-15 12:34:56", row.getField("c0").?);
+    try std.testing.expectEqualStrings("1.00", row.getField("c1").?);
+    try std.testing.expectEqualStrings("hello", row.getField("c2").?);
+    try std.testing.expectEqualStrings("{", row.getField("c3").?);
 }
