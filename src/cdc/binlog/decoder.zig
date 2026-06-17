@@ -63,6 +63,8 @@ pub fn decodeColumn(
         0x11 => decodeTimestamp2(allocator, metadata, body, pos),
         0x0b => decodeTime(allocator, body, pos),
         0x13 => decodeTime2(allocator, metadata, body, pos),
+        0x04 => decodeFloat(allocator, body, pos),
+        0x05 => decodeDouble(allocator, body, pos),
         else => return error.UnsupportedType,
     };
 }
@@ -524,6 +526,22 @@ fn formatUnix(allocator: std.mem.Allocator, secs: i64, microseconds: u64) Decode
     ) catch return error.OutOfMemory;
 }
 
+fn decodeFloat(allocator: std.mem.Allocator, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (body.len < pos.* + 4) return error.BufferTooShort;
+    const raw = std.mem.readInt(u32, body[pos.*..][0..4], .big);
+    pos.* += 4;
+    const f: f32 = @bitCast(raw);
+    return std.fmt.allocPrint(allocator, "{d}", .{f}) catch return error.OutOfMemory;
+}
+
+fn decodeDouble(allocator: std.mem.Allocator, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (body.len < pos.* + 8) return error.BufferTooShort;
+    const raw = std.mem.readInt(u64, body[pos.*..][0..8], .big);
+    pos.* += 8;
+    const f: f64 = @bitCast(raw);
+    return std.fmt.allocPrint(allocator, "{d}", .{f}) catch return error.OutOfMemory;
+}
+
 test "decodeColumn for TINY returns decimal" {
     var pos: usize = 0;
     const buf = [_]u8{42};
@@ -786,4 +804,24 @@ test "decodeColumn for TIME2(6) reads 3+3-byte packed duration with microseconds
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("12:34:56.123456", out);
     try std.testing.expectEqual(@as(usize, 6), pos);
+}
+
+test "decodeColumn for FLOAT reads 4-byte IEEE 754" {
+    var pos: usize = 0;
+    // 1.5 in IEEE 754 single = 0x3fc00000 big-endian
+    const buf = [_]u8{ 0x3f, 0xc0, 0x00, 0x00 };
+    const out = try decodeColumn(std.testing.allocator, 0x04, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("1.5", out);
+    try std.testing.expectEqual(@as(usize, 4), pos);
+}
+
+test "decodeColumn for DOUBLE reads 8-byte IEEE 754" {
+    var pos: usize = 0;
+    // 1.0 in IEEE 754 double = 0x3ff0000000000000 big-endian
+    const buf = [_]u8{ 0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    const out = try decodeColumn(std.testing.allocator, 0x05, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("1", out);
+    try std.testing.expectEqual(@as(usize, 8), pos);
 }
