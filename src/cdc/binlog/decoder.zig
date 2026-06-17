@@ -55,6 +55,8 @@ pub fn decodeColumn(
         0x0f => decodeVarchar(allocator, metadata, body, pos),
         0x0c => decodeDatetime(allocator, body, pos),
         0x12 => decodeDatetime2(allocator, metadata, body, pos),
+        0x0a => decodeDate(allocator, body, pos),
+        0x0d => decodeYear(allocator, body, pos),
         0xf6 => decodeDecimal(allocator, metadata, body, pos),
         0xfc, 0xfd, 0xf5 => decodeBlobLike(allocator, metadata, body, pos),
         else => return error.UnsupportedType,
@@ -168,6 +170,26 @@ fn decodeDatetime2(allocator: std.mem.Allocator, metadata: []const u8, body: []c
     const shift: u6 = @intCast((3 - frac_bytes) * 8);
     const microseconds: u64 = frac_int << shift;
     return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ year, month, day, hour, minute, second, microseconds }) catch return error.OutOfMemory;
+}
+
+fn decodeDate(allocator: std.mem.Allocator, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (body.len < pos.* + 3) return error.BufferTooShort;
+    const v: u32 = (@as(u32, body[pos.*]) << 16) |
+        (@as(u32, body[pos.* + 1]) << 8) |
+        @as(u32, body[pos.* + 2]);
+    pos.* += 3;
+    const year: u32 = v >> 9;
+    const month: u32 = (v >> 5) & 0x0f;
+    const day: u32 = v & 0x1f;
+    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{ year, month, day }) catch return error.OutOfMemory;
+}
+
+fn decodeYear(allocator: std.mem.Allocator, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (body.len < pos.* + 1) return error.BufferTooShort;
+    const v: u32 = body[pos.*];
+    pos.* += 1;
+    const year: u32 = 1900 + v;
+    return std.fmt.allocPrint(allocator, "{d}", .{year}) catch return error.OutOfMemory;
 }
 
 // NEWDECIMAL (0xf6) — MySQL `decimal2bin` wire format.
@@ -501,4 +523,28 @@ test "decodeColumn for JSON with 4-byte length reads N bytes" {
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("{", out);
     try std.testing.expectEqual(@as(usize, 5), pos);
+}
+
+test "decodeColumn for DATE reads 3-byte packed date" {
+    var pos: usize = 0;
+    // 2026-06-15 in MySQL DATE wire format:
+    // val = (year << 9) | (month << 5) | day
+    const val: u32 = (2026 << 9) | (6 << 5) | 15;
+    var buf: [3]u8 = undefined;
+    buf[0] = @intCast((val >> 16) & 0xff);
+    buf[1] = @intCast((val >> 8) & 0xff);
+    buf[2] = @intCast(val & 0xff);
+    const out = try decodeColumn(std.testing.allocator, 0x0a, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("2026-06-15", out);
+    try std.testing.expectEqual(@as(usize, 3), pos);
+}
+
+test "decodeColumn for YEAR reads 1-byte year" {
+    var pos: usize = 0;
+    const buf = [_]u8{122}; // 122 + 1900 = 2022
+    const out = try decodeColumn(std.testing.allocator, 0x0d, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("2022", out);
+    try std.testing.expectEqual(@as(usize, 1), pos);
 }
