@@ -55,8 +55,16 @@ pub fn decodeColumn(
         0x0f => decodeVarchar(allocator, metadata, body, pos),
         0x0c => decodeDatetime(allocator, body, pos),
         0x12 => decodeDatetime2(allocator, metadata, body, pos),
+        0x0a => decodeDate(allocator, body, pos),
+        0x0d => decodeYear(allocator, body, pos),
         0xf6 => decodeDecimal(allocator, metadata, body, pos),
         0xfc, 0xfd, 0xf5 => decodeBlobLike(allocator, metadata, body, pos),
+        0x07 => decodeTimestamp(allocator, body, pos),
+        0x11 => decodeTimestamp2(allocator, metadata, body, pos),
+        0x0b => decodeTime(allocator, body, pos),
+        0x13 => decodeTime2(allocator, metadata, body, pos),
+        0x04 => decodeFloat(allocator, body, pos),
+        0x05 => decodeDouble(allocator, body, pos),
         else => return error.UnsupportedType,
     };
 }
@@ -168,6 +176,26 @@ fn decodeDatetime2(allocator: std.mem.Allocator, metadata: []const u8, body: []c
     const shift: u6 = @intCast((3 - frac_bytes) * 8);
     const microseconds: u64 = frac_int << shift;
     return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ year, month, day, hour, minute, second, microseconds }) catch return error.OutOfMemory;
+}
+
+fn decodeDate(allocator: std.mem.Allocator, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (body.len < pos.* + 3) return error.BufferTooShort;
+    const v: u32 = (@as(u32, body[pos.*]) << 16) |
+        (@as(u32, body[pos.* + 1]) << 8) |
+        @as(u32, body[pos.* + 2]);
+    pos.* += 3;
+    const year: u32 = v >> 9;
+    const month: u32 = (v >> 5) & 0x0f;
+    const day: u32 = v & 0x1f;
+    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{ year, month, day }) catch return error.OutOfMemory;
+}
+
+fn decodeYear(allocator: std.mem.Allocator, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (body.len < pos.* + 1) return error.BufferTooShort;
+    const v: u32 = body[pos.*];
+    pos.* += 1;
+    const year: u32 = 1900 + v;
+    return std.fmt.allocPrint(allocator, "{d}", .{year}) catch return error.OutOfMemory;
 }
 
 // NEWDECIMAL (0xf6) — MySQL `decimal2bin` wire format.
@@ -328,6 +356,190 @@ fn appendLimbDigits(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value
     while (i > 0) : (i -= 1) {
         try out.append(allocator, '0' + buf[i - 1]);
     }
+}
+
+const SECONDS_PER_DAY: i64 = 86400;
+
+// Howard Hinnant's date algorithm: days_from_civil / civil_from_days.
+// Computes days since 1970-01-01 from a (year, month, day) triple.
+// Reference: http://howardhinnant.github.io/date_algorithms.html
+fn daysFromCivil(y: i64, m: u32, d: u32) i64 {
+    const y_adj = if (m <= 2) y - 1 else y;
+    const era: i64 = if (y_adj >= 0) @divFloor(y_adj, 400) else -@divFloor(-y_adj - 399, 400);
+    const yoe: i64 = y_adj - era * 400;
+    const m_adj: i64 = if (m > 2) m - 3 else m + 9;
+    const doy: i64 = @divFloor(153 * m_adj + 2, 5) + d - 1;
+    const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+// Inverse of daysFromCivil: returns (year, month, day) for a given days-since-Unix-epoch.
+fn civilFromDays(z: i64) struct { y: i64, m: u32, d: u32 } {
+    const z_adj = z + 719468;
+    const era: i64 = if (z_adj >= 0) @divFloor(z_adj, 146097) else -@divFloor(-z_adj - 146096, 146097);
+    const doe: i64 = z_adj - era * 146097;
+    const yoe: i64 = @divFloor(doe - @divFloor(doe + 1524, 1461), 365);
+    const y: i64 = yoe + era * 400;
+    const doy: i64 = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp: i64 = @divFloor(5 * doy + 2, 153);
+    const d: u32 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
+    const m: u32 = @intCast(if (mp < 10) mp + 3 else mp - 9);
+    const year: i64 = if (m <= 2) y + 1 else y;
+    return .{ .y = year, .m = m, .d = d };
+}
+
+fn decodeTime(allocator: std.mem.Allocator, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (body.len < pos.* + 3) return error.BufferTooShort;
+    const raw: u32 = (@as(u32, body[pos.*]) << 16) |
+        (@as(u32, body[pos.* + 1]) << 8) |
+        @as(u32, body[pos.* + 2]);
+    pos.* += 3;
+    const is_negative = (raw & 0x800000) != 0;
+    const abs: u32 = if (is_negative) ((~raw + 1) & 0x7fffff) else raw;
+    const hour: u32 = (abs >> 12) & 0x3ff;
+    const minute: u32 = (abs >> 6) & 0x3f;
+    const second: u32 = abs & 0x3f;
+    if (is_negative) {
+        return std.fmt.allocPrint(allocator, "-{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }) catch return error.OutOfMemory;
+    }
+    return std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }) catch return error.OutOfMemory;
+}
+
+fn decodeTime2(allocator: std.mem.Allocator, metadata: []const u8, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (metadata.len < 1) return error.InvalidValue;
+    const fsp: u8 = metadata[0];
+    if (fsp > 6) return error.InvalidValue;
+    const frac_bytes: usize = @intCast(@divFloor(fsp + 1, 2));
+    if (body.len < pos.* + 3 + frac_bytes) return error.BufferTooShort;
+
+    const raw: u32 = (@as(u32, body[pos.*]) << 16) |
+        (@as(u32, body[pos.* + 1]) << 8) |
+        @as(u32, body[pos.* + 2]);
+    pos.* += 3;
+
+    var frac_int: u64 = 0;
+    var i: usize = 0;
+    while (i < frac_bytes) : (i += 1) {
+        frac_int = (frac_int << 8) | body[pos.* + i];
+    }
+    pos.* += frac_bytes;
+    const shift: u6 = @intCast((3 - frac_bytes) * 8);
+    const microseconds: u64 = frac_int << shift;
+
+    const is_negative = (raw & 0x800000) != 0;
+    const abs: u32 = if (is_negative) ((~raw + 1) & 0x7fffff) else raw;
+    const hour: u32 = (abs >> 12) & 0x3ff;
+    const minute: u32 = (abs >> 6) & 0x3f;
+    const second: u32 = abs & 0x3f;
+
+    if (fsp == 0) {
+        if (is_negative) {
+            return std.fmt.allocPrint(allocator, "-{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }) catch return error.OutOfMemory;
+        }
+        return std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }) catch return error.OutOfMemory;
+    }
+    if (is_negative) {
+        return std.fmt.allocPrint(allocator, "-{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ hour, minute, second, microseconds }) catch return error.OutOfMemory;
+    }
+    return std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}", .{ hour, minute, second, microseconds }) catch return error.OutOfMemory;
+}
+
+fn decodeTimestamp(allocator: std.mem.Allocator, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (body.len < pos.* + 4) return error.BufferTooShort;
+    const v = std.mem.readInt(u32, body[pos.*..][0..4], .big);
+    pos.* += 4;
+    const secs: i64 = @intCast(v);
+    return formatUnix(allocator, secs, 0);
+}
+
+fn decodeTimestamp2(allocator: std.mem.Allocator, metadata: []const u8, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (metadata.len < 1) return error.InvalidValue;
+    const fsp: u8 = metadata[0];
+    if (fsp > 6) return error.InvalidValue;
+    const frac_bytes: usize = @intCast(@divFloor(fsp + 1, 2));
+    if (body.len < pos.* + 5 + frac_bytes) return error.BufferTooShort;
+
+    var packed_val: u64 = 0;
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        packed_val = (packed_val << 8) | body[pos.* + i];
+    }
+    pos.* += 5;
+
+    const ymd: u64 = packed_val >> 17;
+    const ym: u64 = ymd >> 5;
+    const year: i64 = @intCast(ym / 13);
+    const month: u32 = @intCast(ym % 13);
+    const day: u32 = @intCast(ymd & 0x1f);
+    const hms: u64 = packed_val & ((@as(u64, 1) << 17) - 1);
+    const hour: u32 = @intCast(hms >> 12);
+    const minute: u32 = @intCast((hms >> 6) & 0x3f);
+    const second: u32 = @intCast(hms & 0x3f);
+
+    var frac_int: u64 = 0;
+    i = 0;
+    while (i < frac_bytes) : (i += 1) {
+        frac_int = (frac_int << 8) | body[pos.* + i];
+    }
+    pos.* += frac_bytes;
+    const shift: u6 = @intCast((3 - frac_bytes) * 8);
+    const microseconds: u64 = frac_int << shift;
+
+    // Compute Unix epoch seconds from civil (y, m, d, h, m, s).
+    const days = daysFromCivil(year, month, day);
+    const secs: i64 = days * SECONDS_PER_DAY + hour * 3600 + minute * 60 + second;
+    // Year is non-negative for all MySQL TIMESTAMP2 values; cast to u64 to
+    // avoid the leading '+' sign that {d} emits for positive signed integers.
+    const year_u: u64 = @intCast(year);
+
+    if (fsp == 0) {
+        return formatUnix(allocator, secs, 0);
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}",
+        .{ year_u, month, day, hour, minute, second, microseconds },
+    ) catch return error.OutOfMemory;
+}
+
+fn formatUnix(allocator: std.mem.Allocator, secs: i64, microseconds: u64) DecodeError![]const u8 {
+    const days: i64 = @divFloor(secs, SECONDS_PER_DAY);
+    const secs_of_day: i64 = @rem(secs, SECONDS_PER_DAY);
+    const civil = civilFromDays(days);
+    // Year is non-negative for any positive Unix epoch; cast to u64 to avoid
+    // the leading '+' sign that {d} emits for positive signed integers.
+    const year_u: u64 = @intCast(civil.y);
+    const hh: u32 = @intCast(@divFloor(secs_of_day, 3600));
+    const mm: u32 = @intCast(@divFloor(@rem(secs_of_day, 3600), 60));
+    const ss: u32 = @intCast(@rem(secs_of_day, 60));
+    if (microseconds == 0) {
+        return std.fmt.allocPrint(
+            allocator,
+            "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}",
+            .{ year_u, civil.m, civil.d, hh, mm, ss },
+        ) catch return error.OutOfMemory;
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}",
+        .{ year_u, civil.m, civil.d, hh, mm, ss, microseconds },
+    ) catch return error.OutOfMemory;
+}
+
+fn decodeFloat(allocator: std.mem.Allocator, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (body.len < pos.* + 4) return error.BufferTooShort;
+    const raw = std.mem.readInt(u32, body[pos.*..][0..4], .big);
+    pos.* += 4;
+    const f: f32 = @bitCast(raw);
+    return std.fmt.allocPrint(allocator, "{d}", .{f}) catch return error.OutOfMemory;
+}
+
+fn decodeDouble(allocator: std.mem.Allocator, body: []const u8, pos: *usize) DecodeError![]const u8 {
+    if (body.len < pos.* + 8) return error.BufferTooShort;
+    const raw = std.mem.readInt(u64, body[pos.*..][0..8], .big);
+    pos.* += 8;
+    const f: f64 = @bitCast(raw);
+    return std.fmt.allocPrint(allocator, "{d}", .{f}) catch return error.OutOfMemory;
 }
 
 test "decodeColumn for TINY returns decimal" {
@@ -501,4 +713,115 @@ test "decodeColumn for JSON with 4-byte length reads N bytes" {
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("{", out);
     try std.testing.expectEqual(@as(usize, 5), pos);
+}
+
+test "decodeColumn for DATE reads 3-byte packed date" {
+    var pos: usize = 0;
+    // 2026-06-15 in MySQL DATE wire format:
+    // val = (year << 9) | (month << 5) | day
+    const val: u32 = (2026 << 9) | (6 << 5) | 15;
+    var buf: [3]u8 = undefined;
+    buf[0] = @intCast((val >> 16) & 0xff);
+    buf[1] = @intCast((val >> 8) & 0xff);
+    buf[2] = @intCast(val & 0xff);
+    const out = try decodeColumn(std.testing.allocator, 0x0a, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("2026-06-15", out);
+    try std.testing.expectEqual(@as(usize, 3), pos);
+}
+
+test "decodeColumn for YEAR reads 1-byte year" {
+    var pos: usize = 0;
+    const buf = [_]u8{122}; // 122 + 1900 = 2022
+    const out = try decodeColumn(std.testing.allocator, 0x0d, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("2022", out);
+    try std.testing.expectEqual(@as(usize, 1), pos);
+}
+
+test "decodeColumn for TIMESTAMP reads 4-byte Unix epoch" {
+    var pos: usize = 0;
+    // 2026-06-15 12:34:56 UTC -> 1781526896
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, 1781526896, .big);
+    const out = try decodeColumn(std.testing.allocator, 0x07, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("2026-06-15 12:34:56", out);
+    try std.testing.expectEqual(@as(usize, 4), pos);
+}
+
+test "decodeColumn for TIMESTAMP2(6) reads 5-byte packed datetime with microseconds" {
+    var pos: usize = 0;
+    // 2026-06-15 12:34:56.123456 in MySQL TIMESTAMP2 wire format:
+    // packed = (year*13+month) << 17 | (day << 12) | (hour << 12) | (minute << 6) | second
+    const ymd: u64 = (2026 * 13 + 6) * 32 + 15;
+    const hms: u64 = (12 << 12) | (34 << 6) | 56;
+    const packed_val: u64 = ymd << 17 | hms;
+    var buf: [8]u8 = undefined;
+    buf[0] = @intCast((packed_val >> 32) & 0xff);
+    buf[1] = @intCast((packed_val >> 24) & 0xff);
+    buf[2] = @intCast((packed_val >> 16) & 0xff);
+    buf[3] = @intCast((packed_val >> 8) & 0xff);
+    buf[4] = @intCast(packed_val & 0xff);
+    buf[5] = 0x01;
+    buf[6] = 0xe2;
+    buf[7] = 0x40;
+    const meta = [_]u8{6};
+    const out = try decodeColumn(std.testing.allocator, 0x11, &meta, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("2026-06-15 12:34:56.123456", out);
+    try std.testing.expectEqual(@as(usize, 8), pos);
+}
+
+test "decodeColumn for TIME reads 3-byte packed duration" {
+    var pos: usize = 0;
+    // 12:34:56 -> 0x12 bf f0
+    // packed = (hour << 12) | (minute << 6) | second
+    const val: u32 = (12 << 12) | (34 << 6) | 56;
+    var buf: [3]u8 = undefined;
+    buf[0] = @intCast((val >> 16) & 0xff);
+    buf[1] = @intCast((val >> 8) & 0xff);
+    buf[2] = @intCast(val & 0xff);
+    const out = try decodeColumn(std.testing.allocator, 0x0b, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("12:34:56", out);
+    try std.testing.expectEqual(@as(usize, 3), pos);
+}
+
+test "decodeColumn for TIME2(6) reads 3+3-byte packed duration with microseconds" {
+    var pos: usize = 0;
+    // 12:34:56.123456
+    const val: u32 = (12 << 12) | (34 << 6) | 56;
+    var buf: [6]u8 = undefined;
+    buf[0] = @intCast((val >> 16) & 0xff);
+    buf[1] = @intCast((val >> 8) & 0xff);
+    buf[2] = @intCast(val & 0xff);
+    buf[3] = 0x01;
+    buf[4] = 0xe2;
+    buf[5] = 0x40;
+    const meta = [_]u8{6};
+    const out = try decodeColumn(std.testing.allocator, 0x13, &meta, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("12:34:56.123456", out);
+    try std.testing.expectEqual(@as(usize, 6), pos);
+}
+
+test "decodeColumn for FLOAT reads 4-byte IEEE 754" {
+    var pos: usize = 0;
+    // 1.5 in IEEE 754 single = 0x3fc00000 big-endian
+    const buf = [_]u8{ 0x3f, 0xc0, 0x00, 0x00 };
+    const out = try decodeColumn(std.testing.allocator, 0x04, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("1.5", out);
+    try std.testing.expectEqual(@as(usize, 4), pos);
+}
+
+test "decodeColumn for DOUBLE reads 8-byte IEEE 754" {
+    var pos: usize = 0;
+    // 1.0 in IEEE 754 double = 0x3ff0000000000000 big-endian
+    const buf = [_]u8{ 0x3f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    const out = try decodeColumn(std.testing.allocator, 0x05, &.{}, &buf, &pos);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("1", out);
+    try std.testing.expectEqual(@as(usize, 8), pos);
 }
