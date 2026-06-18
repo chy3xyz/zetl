@@ -1274,3 +1274,101 @@ test "Parser parses WRITE_ROWS_V2 with DATETIME/DECIMAL/BLOB/JSON columns" {
     try std.testing.expectEqualStrings("hello", row.getField("c2").?);
     try std.testing.expectEqualStrings("{", row.getField("c3").?);
 }
+
+test "Parser parses WRITE_ROWS_V2 with DATE/YEAR/TIME/TIMESTAMP/FLOAT/DOUBLE columns" {
+    const a = std.testing.allocator;
+    var p = Parser.init(a);
+    defer p.deinit();
+
+    // TABLE_MAP: 6 cols [DATE(0x0a), YEAR(0x0d), TIME(0x0b), TIMESTAMP(0x07), FLOAT(0x04), DOUBLE(0x05)]
+    var tm_buf: [80]u8 = undefined;
+    @memset(&tm_buf, 0);
+    std.mem.writeInt(u32, tm_buf[0..4], 0, .little);
+    tm_buf[4] = 0x13;
+    std.mem.writeInt(u32, tm_buf[5..9], 1, .little);
+    std.mem.writeInt(u32, tm_buf[13..17], 0, .little);
+    std.mem.writeInt(u16, tm_buf[17..19], 0, .little);
+    var tpos: usize = 19;
+    std.mem.writeInt(u48, tm_buf[tpos..][0..6], 0x42, .little);
+    tpos += 6;
+    tm_buf[tpos] = 2;
+    tpos += 1;
+    @memcpy(tm_buf[tpos..][0..2], "db");
+    tpos += 2;
+    tm_buf[tpos] = 0;
+    tpos += 1;
+    tm_buf[tpos] = 1;
+    tpos += 1;
+    @memcpy(tm_buf[tpos..][0..1], "t");
+    tpos += 1;
+    tm_buf[tpos] = 0;
+    tpos += 1;
+    tm_buf[tpos] = 6;
+    tpos += 1; // col_count
+    tm_buf[tpos] = 0x0a;
+    tpos += 1; // DATE
+    tm_buf[tpos] = 0x0d;
+    tpos += 1; // YEAR
+    tm_buf[tpos] = 0x0b;
+    tpos += 1; // TIME
+    tm_buf[tpos] = 0x07;
+    tpos += 1; // TIMESTAMP
+    tm_buf[tpos] = 0x04;
+    tpos += 1; // FLOAT
+    tm_buf[tpos] = 0x05;
+    tpos += 1; // DOUBLE
+    tm_buf[tpos] = 0;
+    tpos += 1; // meta_len (0: no metadata)
+    tm_buf[tpos] = 0;
+    tpos += 1; // null_bitmap byte
+    std.mem.writeInt(u32, tm_buf[9..13], @intCast(tpos + 4), .little); // +4 for CRC
+    _ = try p.processEvent(&tm_buf);
+
+    // WRITE_ROWS_V2
+    // post-header(10) + col_count(1) + used_bitmap(1) + num_rows(1) + null_bitmap(1) = 14 bytes prefix
+    // DATE(3) + YEAR(1) + TIME(3) + TIMESTAMP(4) + FLOAT(4) + DOUBLE(8) = 23 bytes values
+    // event_size = 19 + 14 + 23 + 4 (CRC) = 60
+    var wr_buf: [80]u8 = undefined;
+    @memset(&wr_buf, 0);
+    std.mem.writeInt(u32, wr_buf[0..4], 0, .little);
+    wr_buf[4] = 0x1e; // WRITE_ROWS_V2
+    std.mem.writeInt(u32, wr_buf[5..9], 1, .little);
+    std.mem.writeInt(u32, wr_buf[9..13], 60, .little);
+    std.mem.writeInt(u32, wr_buf[13..17], 0, .little);
+    std.mem.writeInt(u16, wr_buf[17..19], 0, .little);
+    std.mem.writeInt(u48, wr_buf[19..25], 0x42, .little);
+    wr_buf[29] = 6; // col_count
+    wr_buf[30] = 0x3f; // used_bitmap: cols 0..5 used
+    wr_buf[31] = 1; // num_rows
+    wr_buf[32] = 0x00; // null_bitmap
+    // DATE: 2026-06-15 -> bytes (2026<<9)|(6<<5)|15 = 0x4ad1a0
+    const date_val: u32 = (2026 << 9) | (6 << 5) | 15;
+    wr_buf[33] = @intCast((date_val >> 16) & 0xff);
+    wr_buf[34] = @intCast((date_val >> 8) & 0xff);
+    wr_buf[35] = @intCast(date_val & 0xff);
+    // YEAR: 126 -> 2026
+    wr_buf[36] = 126;
+    // TIME: 12:34:56 -> (12<<12)|(34<<6)|56 = 0x12bff0
+    const time_val: u32 = (12 << 12) | (34 << 6) | 56;
+    wr_buf[37] = @intCast((time_val >> 16) & 0xff);
+    wr_buf[38] = @intCast((time_val >> 8) & 0xff);
+    wr_buf[39] = @intCast(time_val & 0xff);
+    // TIMESTAMP: 2026-06-15 12:34:56 UTC -> 1781526896
+    std.mem.writeInt(u32, wr_buf[40..44], 1781526896, .big);
+    // FLOAT: 1.5 = 0x3fc00000 big-endian
+    @memcpy(wr_buf[44..48], "\x3f\xc0\x00\x00");
+    // DOUBLE: 1.0 = 0x3ff0000000000000 big-endian
+    @memcpy(wr_buf[48..56], "\x3f\xf0\x00\x00\x00\x00\x00\x00");
+
+    var ev = try p.processEvent(&wr_buf);
+    defer freeRowEvents(a, ev.row);
+
+    try std.testing.expect(ev == .row);
+    const row = &ev.row[0];
+    try std.testing.expectEqualStrings("2026-06-15", row.getField("c0").?);
+    try std.testing.expectEqualStrings("2026", row.getField("c1").?);
+    try std.testing.expectEqualStrings("12:34:56", row.getField("c2").?);
+    try std.testing.expectEqualStrings("2026-06-15 12:34:56", row.getField("c3").?);
+    try std.testing.expectEqualStrings("1.5", row.getField("c4").?);
+    try std.testing.expectEqualStrings("1", row.getField("c5").?);
+}
