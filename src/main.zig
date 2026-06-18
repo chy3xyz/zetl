@@ -100,6 +100,7 @@ test {
     _ = @import("common/alarm.zig");
     _ = @import("meta/datasource.zig");
     _ = @import("meta/task.zig");
+    _ = @import("meta/task/config.zig");
     _ = @import("meta/position.zig");
     _ = @import("meta/store.zig");
     _ = @import("cdc/poller.zig");

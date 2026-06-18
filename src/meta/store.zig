@@ -105,6 +105,29 @@ pub const MetaStore = struct {
             \\)
         );
 
+        // V5 Phase 5: 动态任务配置表 (按 docs/superpowers/specs/2026-06-15-zetl-config-dynamic-tasks-design.md)
+        //   - 取代 YAML 静态任务定义, 通过 /api/tasks HTTP 接口运行时增删改
+        //   - sync_mode: 1=poll / 2=binlog / 3=both (与 task.zig.SyncMode 对齐: full=0/poll=1/binlog=2/both=3)
+        //   - status: 0=disabled / 1=active (与 TaskActiveStatus 枚举对齐)
+        //   - config_json: 任意 JSON, 字段映射/过滤条件/批大小 等扩展配置
+        try self.db.exec(
+            \\CREATE TABLE IF NOT EXISTS tasks_config (
+            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  name TEXT NOT NULL UNIQUE,
+            \\  source_db TEXT NOT NULL,
+            \\  source_table TEXT NOT NULL,
+            \\  target_table TEXT NOT NULL,
+            \\  sync_mode INTEGER NOT NULL DEFAULT 1,
+            \\  config_json TEXT NOT NULL DEFAULT '{}',
+            \\  status INTEGER NOT NULL DEFAULT 1,
+            \\  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            \\  updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            \\)
+        );
+        try self.db.exec(
+            \\CREATE INDEX IF NOT EXISTS idx_tasks_config_status ON tasks_config(status)
+        );
+
         // V1 仅建表不写业务 (V2 启用)
         try self.db.exec(
             \\CREATE TABLE IF NOT EXISTS alarm_config (
