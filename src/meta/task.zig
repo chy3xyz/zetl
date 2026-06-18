@@ -1,8 +1,16 @@
-//! 同步任务 Model + Service
+//! 同步任务 Model + Service (V1)
+//!
+//! V5 Phase 5 扩展: re-export V5 `tasks_config` 子模块:
+//!   - `meta.task.config`   → `TaskConfig` / `TaskActiveStatus`
+//!   - `meta.task.service`  → V5 Service 命名空间 (create/getById/list/update/delete/setStatus)
 
 const std = @import("std");
 const zfinal = @import("zfinal");
 const store_mod = @import("store.zig");
+
+// V5: 暴露给 Scheduler / Web handler 使用.
+pub const config = @import("task/config.zig");
+pub const service = @import("task/service.zig");
 
 pub const SyncMode = enum {
     full,
