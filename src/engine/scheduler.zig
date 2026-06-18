@@ -395,6 +395,280 @@ pub const Scheduler = struct {
         common.logger.inf("任务 {d} 已删除", .{task_id});
     }
 
+    /// V5 Phase 5 Task 4: 重新加载单个任务 (用最新 DB 配置替换 in-memory SyncTask).
+    ///
+    /// 行为 (按顺序, 严格 errdefer 链):
+    ///   1. 快路径停机检查 (无锁).
+    ///   2. 锁外加载最新 V5 `TaskConfig` (避免持锁做 DB IO).
+    ///   3. 加锁, 二次停机检查, `fetchRemove` 旧 entry (可能为 null — 首次重载).
+    ///   4. 锁内: 停止旧 task 线程 (test_mode 跳过).
+    ///   5. 锁内: 构造新 task_ptr (test_mode 走 stub; 生产模式走 addTask 同款路径).
+    ///   6. 锁内: `tasks.put(id, task_ptr)` — put 先于 start (与 addTask 一致).
+    ///   7. 锁内: `task_ptr.start()` — 失败时由 errdefer 链清理 map 条目.
+    ///   8. 锁内: 释放旧 task (test_mode 仅 destroy; 生产模式 deinit + destroy).
+    ///
+    /// 与 `addTask` 的区别:
+    ///   - `addTask`    仅插入; 若 id 已存在返回 `error.TaskAlreadyRunning`
+    ///   - `reloadTask` 替换; 若 id 不存在则视为 "首次重载", fetchRemove 返回 null,
+    ///                    后续走 put → start 等价于 addTask 的生产路径
+    ///
+    /// 错误:
+    ///   - `error.ShutdownInProgress` — 正在停机
+    ///   - `error.TaskNotFound`       — V5 `tasks_config` 无此 id
+    ///   - `error.DatasourceNotFound` — 生产模式 `cfg.source_db` 无匹配 datasource
+    pub fn reloadTask(self: *Scheduler, task_id: i64) !void {
+        // 1. 快路径停机检查 (无锁).
+        if (self.is_shutting_down.load(.acquire)) {
+            common.logger.warn("任务 {d} 重载被拒绝: 正在停机", .{task_id});
+            return error.ShutdownInProgress;
+        }
+
+        // 2. 锁外加载最新 V5 TaskConfig (DB IO 不应持锁).
+        var svc = meta.task.service.Service{ .store = self.store };
+        const cfg = (try svc.getById(task_id)) orelse {
+            common.logger.warn("任务 {d} 不存在 (tasks_config)", .{task_id});
+            return error.TaskNotFound;
+        };
+        defer {
+            var cfg_owned = cfg;
+            cfg_owned.deinit(self.allocator);
+        }
+
+        // 3. 加锁.
+        //    Fix C1: `defer self.mutex.unlock(io);` 自动覆盖所有 return 路径
+        //    (error + success), 取代之前在 success / 二次停机检查中手动 unlock 的反模式.
+        const io = zfinal.io_instance.io;
+        self.mutex.lock(io) catch return error.LockFailed;
+        defer self.mutex.unlock(io);
+
+        // 二次停机检查 (防止刚进入临界区时 stopAll 置位 flag).
+        if (self.is_shutting_down.load(.acquire)) {
+            return error.ShutdownInProgress;
+        }
+
+        // 4. fetchRemove 旧 entry (可能为 null — 首次重载).
+        const old_entry = self.tasks.fetchRemove(task_id);
+
+        // Fix C3: 旧 entry 清理 defer (覆盖 put/start 失败路径).
+        //   失败时: deinit + destroy (生产) / 仅 destroy (test_mode).
+        //   成功时: 在底部显式清理后, 设 flag = false 让 defer 跳过.
+        var old_cleanup_needed = old_entry != null;
+        defer if (old_cleanup_needed) {
+            if (old_entry) |kv| {
+                if (!self.test_mode) kv.value.deinit();
+                self.allocator.destroy(kv.value);
+            }
+        };
+
+        // 5. 停止旧 task 线程 (test_mode 跳过 — stub 无运行线程).
+        //    stop() 无副作用, 失败路径由 old_cleanup_needed defer 兜底.
+        if (old_entry) |kv| {
+            if (!self.test_mode) {
+                kv.value.stop();
+            }
+        }
+
+        // 6. 构造新 task_ptr.
+        //    blk 作用域限制 errdefer: 仅在 create/init 失败时回收 struct 内存,
+        //    不触碰 SyncTask 字段 (与 addTask 同款已知限制: init 失败时部分字段泄漏).
+        const task_ptr = blk: {
+            const t = try self.allocator.create(runtime.SyncTask);
+            errdefer self.allocator.destroy(t);
+            if (self.test_mode) {
+                // test_mode stub — 与 addTask 同款, 跳过 transformer/sink/poller 真实实例化.
+                t.* = runtime.SyncTask{
+                    .allocator = self.allocator,
+                    .cfg = .{
+                        .task_id = cfg.id,
+                        .source_table = cfg.source_table,
+                        .target_table = cfg.target_table,
+                        .mall_id = cfg.source_db,
+                    },
+                    .transformer = undefined,
+                    .sink = undefined,
+                    .store = self.store,
+                    .sink_pool = undefined,
+                    .src_pool = undefined,
+                    .poller = undefined,
+                    ._sh = &[_]u8{},
+                    ._sd = &[_]u8{},
+                    ._su = &[_]u8{},
+                    ._sp = &[_]u8{},
+                    .pos = .{ .task_id = cfg.id },
+                };
+            } else {
+                // 生产模式: 与 addTask 同步路径一致.
+                // (TODO Phase 6: 提取 buildSyncTask 公共函数, 消除重复.)
+                const ds = (try meta.datasource.Service.findByMallId(self.store, self.allocator, cfg.source_db)) orelse {
+                    common.logger.err_("任务 {d} (source_db={s}) 绑定的数据源不存在", .{ task_id, cfg.source_db });
+                    return error.DatasourceNotFound;
+                };
+                defer {
+                    var d = ds;
+                    d.deinit(self.allocator);
+                }
+
+                const sync_mode: meta.task.SyncMode = switch (cfg.sync_mode) {
+                    0 => .full,
+                    1 => .poll,
+                    2 => .binlog,
+                    3 => .both,
+                    else => .poll,
+                };
+                const rcfg = runtime.RuntimeConfig{
+                    .task_id = cfg.id,
+                    .source_table = cfg.source_table,
+                    .target_table = cfg.target_table,
+                    .batch_size = 1000,
+                    .sync_mode = sync_mode,
+                    .enable_commission_calc = false,
+                    .mall_id = ds.mall_id,
+                };
+
+                const src_host = try self.allocator.dupe(u8, ds.host);
+                const src_db = try self.allocator.dupe(u8, ds.db_name);
+                const src_user = try self.allocator.dupe(u8, ds.username);
+                const src_pass = try self.allocator.dupe(u8, ds.password);
+                const src_cfg = zfinal.DBConfig{
+                    .db_type = .mysql,
+                    .host = src_host,
+                    .port = ds.port,
+                    .database = src_db,
+                    .username = src_user,
+                    .password = src_pass,
+                };
+                const src_pool = try zfinal.ConnectionPool.init(self.allocator, src_cfg, 1);
+
+                t.* = try runtime.SyncTask.init(self.allocator, rcfg, ds, self.store, self.sink_pool, src_pool, src_host, src_db, src_user, src_pass);
+            }
+            break :blk t;
+        };
+
+        // Fix C2: 新 task_ptr 清理 defer (覆盖 put/start 失败路径, 与 addTask 同款 cleanup_needed 模式).
+        //   失败时: deinit + destroy (生产) / 仅 destroy (test_mode, 跳过 stub deinit).
+        //   成功时: 在底部设 flag = false 让 defer 跳过.
+        var cleanup_needed = true;
+        defer if (cleanup_needed) {
+            if (!self.test_mode) task_ptr.deinit();
+            self.allocator.destroy(task_ptr);
+        };
+
+        // 7. put 到 map (put 先于 start, 与 addTask 同款 — start 失败时由 errdefer 清 map).
+        try self.tasks.put(task_id, task_ptr);
+        errdefer _ = self.tasks.fetchRemove(task_id);
+
+        // 8. 启动新 task (test_mode 跳过).
+        if (!self.test_mode) {
+            task_ptr.start() catch |err| {
+                common.logger.err_("任务 {d} ({s}) 重载后启动线程失败: {s}", .{ task_id, cfg.name, @errorName(err) });
+                return err;
+            };
+        }
+
+        // 9. 成功路径: 显式清理旧 task (test_mode 仅 destroy; 生产模式 deinit + destroy).
+        //    注: 持锁做 deinit 可能阻塞 (thread.join) — 与 spec 保持一致, 简单化.
+        if (old_entry) |kv| {
+            if (!self.test_mode) {
+                kv.value.deinit();
+            }
+            self.allocator.destroy(kv.value);
+        }
+        old_cleanup_needed = false;
+
+        // 10. 所有权已转交 map, defer 不再清理.
+        cleanup_needed = false;
+
+        if (self.test_mode) {
+            common.logger.inf("[test] 任务 {d} ({s}) 已重载 (stub)", .{ task_id, cfg.name });
+        } else {
+            common.logger.inf("任务 {d} ({s}) 重载完成", .{ task_id, cfg.name });
+        }
+    }
+
+    /// V5 Phase 5 Task 4: 列出所有已注册任务的 V5 TaskConfig.
+    ///
+    /// 行为:
+    ///   - 锁内遍历 `self.tasks` map, 对每个 task_id 调 `svc.getById` 取最新配置.
+    ///   - 若 DB 行已被删除 (map 中残留, 罕见), 跳过该 id (仅打 warn).
+    ///   - 返回的 `[]TaskConfig` 由调用方负责 `deinit` + `free`.
+    ///
+    /// 与 `listRunning` 的区别:
+    ///   - `listRunning`  只返回 `[]i64` (id 列表)
+    ///   - `listTasks`   返回 `[]TaskConfig` (含完整字段, 供 HTTP API 序列化)
+    pub fn listTasks(self: *Scheduler) ![]meta.task.service.TaskConfig {
+        const a = self.allocator;
+        const io = zfinal.io_instance.io;
+
+        // Fix I1: 锁内仅快照 keys, 锁外做 DB I/O.
+        //   旧实现持锁调 svc.getById, DB 查询期间阻塞 addTask/removeTask/reloadTask.
+        const ids: []const i64 = blk: {
+            self.mutex.lock(io) catch return error.LockFailed;
+            defer self.mutex.unlock(io);
+            var buf = try a.alloc(i64, self.tasks.count());
+            var i: usize = 0;
+            var it = self.tasks.iterator();
+            while (it.next()) |kv| {
+                buf[i] = kv.key_ptr.*;
+                i += 1;
+            }
+            break :blk buf;
+        };
+        defer a.free(ids);
+
+        var svc = meta.task.service.Service{ .store = self.store };
+        var list = std.ArrayList(meta.task.service.TaskConfig).empty;
+        errdefer {
+            for (list.items) |*c| c.deinit(a);
+            list.deinit(a);
+        }
+        for (ids) |id| {
+            const cfg = (try svc.getById(id)) orelse {
+                common.logger.warn("listTasks: 任务 {d} 在 tasks_config 中已不存在, 跳过", .{id});
+                continue;
+            };
+            // 单条 cfg 在 list.append 失败时需释放, 成功则由 list 接管.
+            // TaskConfig.deinit 签名是 *TaskConfig (非 const), 需 var 拷贝去 const 限定.
+            errdefer {
+                var cfg_owned = cfg;
+                cfg_owned.deinit(a);
+            }
+            try list.append(a, cfg);
+        }
+        return list.toOwnedSlice(a) catch return error.OutOfMemory;
+    }
+
+    /// V5 Phase 5 Task 4: 启动时批量加载所有 `status=.active` 任务.
+    ///
+    /// 行为:
+    ///   - 查 `tasks_config` 表, 过滤 `status = .active` 的所有行.
+    ///   - 对每行调 `addTask`; 单个 task 失败不阻塞整体, 仅打 warn 继续.
+    ///   - 用于 `main.zig` 启动 web server 之前, 让已配置的 active 任务自动跑起来.
+    ///
+    /// 与 `bootstrapAll` 的区别:
+    ///   - `bootstrapAll` 加载 V1 `sync_task` 表 (旧路径, 兼容 Phase 1-4)
+    ///   - `loadFromDb`  加载 V5 `tasks_config` 表 (新路径, Phase 5 动态任务)
+    pub fn loadFromDb(self: *Scheduler) !void {
+        var svc = meta.task.service.Service{ .store = self.store };
+        const cfgs = try svc.list(.active);
+        defer {
+            for (cfgs) |*c| c.deinit(self.allocator);
+            self.allocator.free(cfgs);
+        }
+        common.logger.inf("loadFromDb: 启动时发现 {d} 个 active 任务", .{cfgs.len});
+        // Fix I3: 累计成功/失败计数, 函数末尾输出汇总行 — 供日志告警/grep 触发.
+        var failed: usize = 0;
+        var succeeded: usize = 0;
+        for (cfgs) |cfg| {
+            // 单个 task 失败不应阻塞整个启动流程 — 仅打 warn, 继续下一个.
+            self.addTask(cfg.id) catch |err| {
+                failed += 1;
+                common.logger.warn("loadFromDb: 任务 {d} ({s}) 启动失败: {s}", .{ cfg.id, cfg.name, @errorName(err) });
+            };
+            succeeded += 1;
+        }
+        common.logger.inf("loadFromDb 完成: {d} 任务加载, {d} 启动失败", .{ succeeded, failed });
+    }
+
     /// 启动所有 status=1 的任务 (启动时调用)
     pub fn bootstrapAll(self: *Scheduler) !void {
         const tasks = try meta.task.Service.findEnabled(self.store, self.allocator);
@@ -652,4 +926,132 @@ test "Scheduler addTask returns ShutdownInProgress when shutting down" {
 
     sched.is_shutting_down.store(true, .release);
     try std.testing.expectError(error.ShutdownInProgress, sched.addTask(id));
+}
+
+// ============================================================
+// V5 Phase 5 Task 4: reloadTask / listTasks / loadFromDb
+// ============================================================
+//
+// Task 4 在 Task 3 (addTask/removeTask) 之上扩展:
+//   - reloadTask:  用最新 DB 配置替换 in-memory SyncTask
+//   - listTasks:   返回所有已注册 task 的 V5 TaskConfig 列表
+//   - loadFromDb:  启动时批量加载 status=.active 任务
+//
+// 单测统一走 test_mode (Scheduler.initForTest) 路径, 不实例化真实 SyncTask.
+//   - reloadTask: stub 替换 + DB 行可独立更新 (验证 reload 不破坏 DB 一致性)
+//   - listTasks:  验证 map 中所有 task id 都返回对应 V5 TaskConfig
+//   - loadFromDb: 验证 active 被加载, disabled 被跳过
+
+test "Scheduler reloadTask swaps existing task with new config" {
+    const a = std.testing.allocator;
+    var db = try makeTestStore(a);
+    defer db.deinit();
+
+    var sched = Scheduler.initForTest(a, &db);
+    defer sched.deinit();
+
+    var svc = meta.task.service.Service{ .store = &db };
+    const id = try svc.create(.{
+        .name = "order_sync",
+        .source_db = "primary",
+        .source_table = "order_info",
+        .target_table = "order_info",
+        .sync_mode = 1,
+        .config_json = "{\"polling_interval_sec\":60}",
+    });
+
+    try sched.addTask(id);
+
+    // 更新 DB 行的 config_json, 然后 reload. reload 本身不应破坏 DB 一致性.
+    try svc.update(id, .{
+        .name = "order_sync",
+        .source_db = "primary",
+        .source_table = "order_info",
+        .target_table = "order_info",
+        .sync_mode = 1,
+        .config_json = "{\"polling_interval_sec\":30}",
+    });
+
+    try sched.reloadTask(id);
+
+    // 重载后 DB 行的 config_json 应仍是更新后的值.
+    const got = (try svc.getById(id)).?;
+    var owned = got;
+    defer owned.deinit(a);
+    try std.testing.expectEqualStrings("{\"polling_interval_sec\":30}", owned.config_json);
+}
+
+test "Scheduler listTasks returns all registered tasks" {
+    const a = std.testing.allocator;
+    var db = try makeTestStore(a);
+    defer db.deinit();
+
+    var sched = Scheduler.initForTest(a, &db);
+    defer sched.deinit();
+
+    var svc = meta.task.service.Service{ .store = &db };
+    const id_a = try svc.create(.{
+        .name = "a",
+        .source_db = "p",
+        .source_table = "t",
+        .target_table = "t",
+        .sync_mode = 1,
+        .config_json = "{}",
+    });
+    const id_b = try svc.create(.{
+        .name = "b",
+        .source_db = "p",
+        .source_table = "t",
+        .target_table = "t",
+        .sync_mode = 1,
+        .config_json = "{}",
+    });
+
+    try sched.addTask(id_a);
+    try sched.addTask(id_b);
+
+    const list = try sched.listTasks();
+    defer {
+        for (list) |*c| c.deinit(a);
+        a.free(list);
+    }
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+}
+
+test "Scheduler loadFromDb hydrates all active tasks but skips disabled" {
+    const a = std.testing.allocator;
+    var db = try makeTestStore(a);
+    defer db.deinit();
+
+    var svc = meta.task.service.Service{ .store = &db };
+    _ = try svc.create(.{
+        .name = "a",
+        .source_db = "p",
+        .source_table = "t",
+        .target_table = "t",
+        .sync_mode = 1,
+        .config_json = "{}",
+        .status = .active,
+    });
+    _ = try svc.create(.{
+        .name = "b",
+        .source_db = "p",
+        .source_table = "t",
+        .target_table = "t",
+        .sync_mode = 1,
+        .config_json = "{}",
+        .status = .disabled,
+    });
+
+    var sched = Scheduler.initForTest(a, &db);
+    defer sched.deinit();
+    try sched.loadFromDb();
+
+    const list = try sched.listTasks();
+    defer {
+        for (list) |*c| c.deinit(a);
+        a.free(list);
+    }
+    try std.testing.expectEqual(@as(usize, 1), list.len);
+    try std.testing.expectEqualStrings("a", list[0].name);
 }
