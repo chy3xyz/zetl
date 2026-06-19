@@ -70,6 +70,39 @@ pub const TransformEngine = struct {
         };
     }
 
+    /// 带 source schema 的 init. 先 fromSchema 生成 identity 映射, 再 mergeOverrides 应用用户覆盖.
+    /// calculator 与 init 行为一致 (始终创建), enable_commission_calc 仅控制 process() 时是否启用.
+    pub fn initWithSchema(
+        allocator: std.mem.Allocator,
+        cfg: TransformConfig,
+        source_columns: []const mapper_mod.ColumnMeta,
+    ) !TransformEngine {
+        var mp = try mapper_mod.Mapper.fromSchema(allocator, source_columns);
+        errdefer mp.deinit();
+
+        if (cfg.field_mappings_json) |fm| {
+            if (fm.len > 0) {
+                try mp.mergeOverrides(allocator, fm);
+            }
+        }
+
+        return .{
+            .allocator = allocator,
+            .cfg = .{
+                .mall_id = try allocator.dupe(u8, cfg.mall_id),
+                .source_type = try allocator.dupe(u8, cfg.source_type),
+                .field_mappings_json = if (cfg.field_mappings_json) |fm| try allocator.dupe(u8, fm) else null,
+                .filter_condition = if (cfg.filter_condition) |f| try allocator.dupe(u8, f) else null,
+                .enable_commission_calc = cfg.enable_commission_calc,
+                .filter_field = if (cfg.filter_field) |f| try allocator.dupe(u8, f) else null,
+                .filter_op = cfg.filter_op,
+                .filter_value = if (cfg.filter_value) |v| try allocator.dupe(u8, v) else null,
+            },
+            .mapper = mp,
+            .calculator = commission_mod.Calculator.init(allocator),
+        };
+    }
+
     pub fn deinit(self: *TransformEngine) void {
         self.mapper.deinit();
         self.calculator.deinit();
@@ -274,4 +307,50 @@ test "transform: delete event sets is_delete=1" {
     try std.testing.expectEqualStrings("1", target.get("is_delete").?);
     try std.testing.expectEqualStrings("mall_003", target.get("mall_id").?);
     try std.testing.expectEqualStrings("ON_DEL_001", target.get("order_no").?);
+}
+
+test "TransformEngine.init with empty source_columns uses field_mappings_json" {
+    const a = std.testing.allocator;
+    const cfg = TransformConfig{
+        .mall_id = "mall_test_empty",
+        .field_mappings_json = "[]",
+    };
+    var eng = try TransformEngine.init(a, cfg);
+    defer eng.deinit();
+    try std.testing.expectEqual(@as(usize, 0), eng.mapper.mappings.len);
+}
+
+test "TransformEngine.initWithSchema generates identity mappings" {
+    const a = std.testing.allocator;
+    const cfg = TransformConfig{
+        .mall_id = "mall_schema",
+        .field_mappings_json = "",
+    };
+    const cols = [_]mapper_mod.ColumnMeta{
+        .{ .name = "order_id" },
+        .{ .name = "amount" },
+    };
+    var eng = try TransformEngine.initWithSchema(a, cfg, &cols);
+    defer eng.deinit();
+    try std.testing.expectEqual(@as(usize, 2), eng.mapper.mappings.len);
+    try std.testing.expectEqualStrings("order_id", eng.mapper.mappings[0].source);
+    try std.testing.expectEqualStrings("order_id", eng.mapper.mappings[0].target);
+    try std.testing.expectEqualStrings("amount", eng.mapper.mappings[1].target);
+}
+
+test "TransformEngine.initWithSchema merges user overrides" {
+    const a = std.testing.allocator;
+    const override_json = "[{\"source\":\"order_id\",\"target\":\"id\"}]";
+    const cfg = TransformConfig{
+        .mall_id = "mall_merge",
+        .field_mappings_json = override_json,
+    };
+    const cols = [_]mapper_mod.ColumnMeta{
+        .{ .name = "order_id" },
+        .{ .name = "amount" },
+    };
+    var eng = try TransformEngine.initWithSchema(a, cfg, &cols);
+    defer eng.deinit();
+    try std.testing.expectEqual(@as(usize, 2), eng.mapper.mappings.len);
+    try std.testing.expectEqualStrings("id", eng.mapper.mappings[0].target);
 }
