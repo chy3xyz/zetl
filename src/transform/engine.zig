@@ -77,7 +77,7 @@ pub const TransformEngine = struct {
         cfg: TransformConfig,
         source_columns: []const mapper_mod.ColumnMeta,
     ) !TransformEngine {
-        var mp = try mapper_mod.Mapper.fromSchema(allocator, source_columns);
+        var mp = try mapper_mod.Mapper.fromSchema(allocator, source_columns, null);
         errdefer mp.deinit();
 
         if (cfg.field_mappings_json) |fm| {

@@ -114,8 +114,10 @@ pub const Mapper = struct {
         self.allocator.free(self.mappings);
     }
 
-    /// 从 source 列元数据生成 identity 映射 (列名 == 列名).
-    pub fn fromSchema(allocator: std.mem.Allocator, columns: []const ColumnMeta) !Mapper {
+    /// 从 source 列元数据生成 mappings. 可选命名规则把 source 列名转 target.
+    /// rule = null 等价 .identity (默认行为).
+    pub fn fromSchema(allocator: std.mem.Allocator, columns: []const ColumnMeta, rule: ?NamingRule) !Mapper {
+        const effective_rule = rule orelse .identity;
         var mappings = try allocator.alloc(FieldMapping, columns.len);
         errdefer {
             for (mappings) |m| {
@@ -127,7 +129,7 @@ pub const Mapper = struct {
         for (columns, 0..) |col, i| {
             mappings[i] = .{
                 .source = try allocator.dupe(u8, col.name),
-                .target = try allocator.dupe(u8, col.name),
+                .target = try applyNamingRule(effective_rule, col.name, allocator),
             };
         }
         return Mapper{ .allocator = allocator, .mappings = mappings };
@@ -368,7 +370,7 @@ test "Mapper.fromSchema generates identity mappings" {
         .{ .name = "paid_at" },
         .{ .name = "amount" },
     };
-    var m = try Mapper.fromSchema(a, &cols);
+    var m = try Mapper.fromSchema(a, &cols, null);
     defer m.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), m.mappings.len);
@@ -380,13 +382,25 @@ test "Mapper.fromSchema generates identity mappings" {
     try std.testing.expectEqualStrings("amount", m.mappings[2].target);
 }
 
+test "Mapper.fromSchema with camel_to_snake rule converts source to snake" {
+    const a = std.testing.allocator;
+    const cols = [_]ColumnMeta{
+        .{ .name = "orderId" },
+        .{ .name = "paidAt" },
+    };
+    var m = try Mapper.fromSchema(a, &cols, .camel_to_snake);
+    defer m.deinit();
+    try std.testing.expectEqualStrings("order_id", m.mappings[0].target);
+    try std.testing.expectEqualStrings("paid_at", m.mappings[1].target);
+}
+
 test "Mapper.mergeOverrides replaces target for matching source" {
     const a = std.testing.allocator;
     const cols = [_]ColumnMeta{
         .{ .name = "order_id" },
         .{ .name = "paid_at" },
     };
-    var m = try Mapper.fromSchema(a, &cols);
+    var m = try Mapper.fromSchema(a, &cols, null);
     defer m.deinit();
 
     try m.mergeOverrides(a,
@@ -402,7 +416,7 @@ test "Mapper.mergeOverrides replaces target for matching source" {
 test "Mapper.mergeOverrides with empty json is no-op" {
     const a = std.testing.allocator;
     const cols = [_]ColumnMeta{.{ .name = "x" }};
-    var m = try Mapper.fromSchema(a, &cols);
+    var m = try Mapper.fromSchema(a, &cols, null);
     defer m.deinit();
     try m.mergeOverrides(a, "");
     try std.testing.expectEqual(@as(usize, 1), m.mappings.len);
@@ -412,7 +426,7 @@ test "Mapper.mergeOverrides with empty json is no-op" {
 test "Mapper.mergeOverrides appends user-only mappings" {
     const a = std.testing.allocator;
     const cols = [_]ColumnMeta{.{ .name = "x" }};
-    var m = try Mapper.fromSchema(a, &cols);
+    var m = try Mapper.fromSchema(a, &cols, null);
     defer m.deinit();
 
     try m.mergeOverrides(a,
