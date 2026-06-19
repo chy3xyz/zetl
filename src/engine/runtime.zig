@@ -483,3 +483,56 @@ fn curTs() i64 {
     if (std.c.gettimeofday(&tv, null) != 0) return 0;
     return @intCast(tv.sec);
 }
+
+// ============================================================================
+// 单元测试 — TaskStatus 状态机 + 原子字段语义 + 幂等 deinit 保护
+// P2 任务 6 (2026-06-19)
+// ============================================================================
+
+test "TaskStatus enum variants stringify correctly" {
+    try std.testing.expectEqualStrings("pending", @tagName(TaskStatus.pending));
+    try std.testing.expectEqualStrings("running", @tagName(TaskStatus.running));
+    try std.testing.expectEqualStrings("success", @tagName(TaskStatus.success));
+    // @"error" 在 Zig 中仅是保留字转义, @tagName 返回纯标识符 "error"
+    try std.testing.expectEqualStrings("error", @tagName(TaskStatus.@"error"));
+}
+
+test "atomic state field transitions: pending -> running -> success" {
+    var state = std.atomic.Value(TaskStatus).init(.pending);
+    try std.testing.expectEqual(TaskStatus.pending, state.load(.acquire));
+
+    state.store(.running, .release);
+    try std.testing.expectEqual(TaskStatus.running, state.load(.acquire));
+
+    state.store(.success, .release);
+    try std.testing.expectEqual(TaskStatus.success, state.load(.acquire));
+}
+
+test "atomic state field transitions: pending -> running -> error" {
+    var state = std.atomic.Value(TaskStatus).init(.pending);
+    state.store(.running, .release);
+    state.store(.@"error", .release);
+    try std.testing.expectEqual(TaskStatus.@"error", state.load(.acquire));
+}
+
+test "should_stop atomic flag toggles independently" {
+    var flag = std.atomic.Value(bool).init(false);
+    try std.testing.expectEqual(false, flag.load(.acquire));
+    flag.store(true, .release);
+    try std.testing.expectEqual(true, flag.load(.acquire));
+    flag.store(false, .release);
+    try std.testing.expectEqual(false, flag.load(.acquire));
+}
+
+test "_deinit_done flag is single-shot" {
+    var flag = std.atomic.Value(bool).init(false);
+    try std.testing.expectEqual(false, flag.swap(true, .acq_rel));
+    try std.testing.expectEqual(true, flag.swap(true, .acq_rel));
+    try std.testing.expectEqual(true, flag.load(.acquire));
+}
+
+test "_pool_deinit_done flag is single-shot" {
+    var flag = std.atomic.Value(bool).init(false);
+    try std.testing.expectEqual(false, flag.swap(true, .acq_rel));
+    try std.testing.expectEqual(true, flag.load(.acquire));
+}
