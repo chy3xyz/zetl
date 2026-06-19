@@ -103,12 +103,27 @@ pub const SyncTask = struct {
     }
 
     pub fn deinit(self: *SyncTask) void {
+        // 幂等: 第二次调用直接返回.
+        if (self._deinit_done.swap(true, .acq_rel)) return;
+
+        // 如果仍在 running, 触发 stop 并 join.
+        const current = self.state.load(.acquire);
+        if (current == .running) {
+            self.should_stop.store(true, .release);
+            if (self.thread) |t| {
+                t.join();
+                self.thread = null;
+            }
+            // runLoop 已退出但可能还没改 state — 主动置 success.
+            self.state.store(.success, .release);
+        }
+
         self.transformer.deinit();
         self.sink.deinit();
-        // src_pool 由 ConnectionPool.init 在内部 self-destroy, 外部只需 deinit.
-        self.src_pool.deinit();
-        // binlog_db 必须在 _sh/_sd/_su/_sp 释放前 deinit — MySQL driver 不持有外部字符串引用,
-        // 但顺序上保持 deinit 早于堆字符串释放更安全 (后续若 driver 变化).
+        // src_pool 双重 deinit 会段错误 (zfinal ConnectionPool 内部 self-destroy).
+        if (!self._pool_deinit_done.swap(true, .acq_rel)) {
+            self.src_pool.deinit();
+        }
         if (self.binlog_db) |*bd| bd.deinit();
         self.allocator.free(self._sh);
         self.allocator.free(self._sd);
