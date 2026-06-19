@@ -31,6 +31,14 @@ pub const BinlogStartPos = struct {
     pos: i64,
 };
 
+/// SyncTask 生命周期状态. 所有转换通过 atomic.Value 在 SyncTask 结构体内同步.
+pub const TaskStatus = enum(u8) {
+    pending = 0,
+    running = 1,
+    success = 2,
+    @"error" = 3,
+};
+
 pub const SyncTask = struct {
     allocator: std.mem.Allocator,
     cfg: RuntimeConfig,
@@ -46,16 +54,22 @@ pub const SyncTask = struct {
     _sp: []u8, // 持有 src DBConfig 的 dupe'd 字符串
     /// binlog CDC 用的源库 DB 连接 (P2 Task 11 注入, 当前为 null).
     binlog_db: ?zfinal.DB = null,
-    is_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// runLoop 退出后置 true, 供 stopAll 提前结束等待.
+    /// 当前任务状态. 所有转换: start → running, runLoop 退出 → success/error.
+    state: std.atomic.Value(TaskStatus) = std.atomic.Value(TaskStatus).init(.pending),
+    /// stop() 翻转此标志, runLoop 检测后优雅退出. 与 state 字段独立 (state 是结果, 这是原因).
+    should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// runLoop 退出后置 true, 供 stopAll 提前结束等待. 与 state 区分: state=结果, is_finished=过程完成.
     is_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// deinit() 幂等保护: 多次调用只生效一次.
+    _deinit_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// src_pool.deinit() 幂等保护: zfinal ConnectionPool 二次 deinit 会 crash.
+    _pool_deinit_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 上次成功加载佣金规则的 Unix 时间 (秒). 0 = 从未成功加载过.
     /// 用于 stale-retry: 归集库恢复后, 每隔 rules_max_age_sec 再尝试拉一次.
     last_rules_loaded_at: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     /// 规则过期阈值 (秒). 默认 300s = 5 min. 0 = 每次同步都重新加载.
     rules_max_age_sec: i64 = 300,
     pos: meta.position.SyncPosition,
-    status: i32 = 1,
     last_error: ?[]const u8 = null,
     thread: ?std.Thread = null,
 
