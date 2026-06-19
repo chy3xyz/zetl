@@ -200,9 +200,9 @@ test "permissionInterceptor: factory works with all P1 perm categories" {
         "task:read",       "task:write",
         "reconcile:read",  "reconcile:run",
         "alarm:read",      "alarm:write",
-        "audit:read",
-        "user:read",       "user:write",
-        "role:read",       "role:write",
+        "audit:read",      "user:read",
+        "user:write",      "role:read",
+        "role:write",
     };
     inline for (perms) |p| {
         const intc = permissionInterceptor(p);
