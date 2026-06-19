@@ -12,6 +12,13 @@ pub const FieldMapping = struct {
     type_convert: ?[]const u8 = null,
 };
 
+/// Source schema 列元数据, 用于自动生成默认映射.
+pub const ColumnMeta = struct {
+    name: []const u8,
+    /// MySQL 类型常量 (可选, 暂未使用).
+    type: u8 = 0,
+};
+
 pub const Mapper = struct {
     allocator: std.mem.Allocator,
     mappings: []FieldMapping = &.{},
@@ -24,6 +31,25 @@ pub const Mapper = struct {
             if (m.type_convert) |t| self.allocator.free(t);
         }
         self.allocator.free(self.mappings);
+    }
+
+    /// 从 source 列元数据生成 identity 映射 (列名 == 列名).
+    pub fn fromSchema(allocator: std.mem.Allocator, columns: []const ColumnMeta) !Mapper {
+        var mappings = try allocator.alloc(FieldMapping, columns.len);
+        errdefer {
+            for (mappings) |m| {
+                allocator.free(m.source);
+                allocator.free(m.target);
+            }
+            allocator.free(mappings);
+        }
+        for (columns, 0..) |col, i| {
+            mappings[i] = .{
+                .source = try allocator.dupe(u8, col.name),
+                .target = try allocator.dupe(u8, col.name),
+            };
+        }
+        return Mapper{ .allocator = allocator, .mappings = mappings };
     }
 
     /// 从 task.field_mappings (JSON 字符串) 解析
@@ -201,4 +227,23 @@ test "mapper: source field reuses underlying value" {
     }
     try std.testing.expectEqualStrings("42", target.get("id").?);
     try std.testing.expectEqualStrings("Alice", target.get("user_name").?);
+}
+
+test "Mapper.fromSchema generates identity mappings" {
+    const a = std.testing.allocator;
+    const cols = [_]ColumnMeta{
+        .{ .name = "order_id" },
+        .{ .name = "paid_at" },
+        .{ .name = "amount" },
+    };
+    var m = try Mapper.fromSchema(a, &cols);
+    defer m.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), m.mappings.len);
+    try std.testing.expectEqualStrings("order_id", m.mappings[0].source);
+    try std.testing.expectEqualStrings("order_id", m.mappings[0].target);
+    try std.testing.expectEqualStrings("paid_at", m.mappings[1].source);
+    try std.testing.expectEqualStrings("paid_at", m.mappings[1].target);
+    try std.testing.expectEqualStrings("amount", m.mappings[2].source);
+    try std.testing.expectEqualStrings("amount", m.mappings[2].target);
 }
