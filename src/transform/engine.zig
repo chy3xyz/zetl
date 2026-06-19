@@ -242,19 +242,15 @@ pub const TransformEngine = struct {
         };
     }
 
-    /// 带 source schema 的 init. 先 fromSchema 应用命名规则生成初始映射, 再 mergeOverrides 应用用户覆盖.
-    /// `rule` 传给 Mapper.fromSchema: null = identity (默认); 非 null 时按 NamingRule 转换 source → target 列名.
+    /// 带 source schema 的 init. 先 fromSchema 应用命名规则 pipeline 生成初始映射, 再 mergeOverrides 应用用户覆盖.
+    /// `rules` 传给 Mapper.fromSchema: 空切片 = identity (默认); 非空时按 pipeline 顺序应用 NamingRule 转换 source → target 列名.
     /// calculator 与 init 行为一致 (始终创建), enable_commission_calc 仅控制 process() 时是否启用.
     pub fn initWithSchema(
         allocator: std.mem.Allocator,
         cfg: TransformConfig,
         source_columns: []const mapper_mod.ColumnMeta,
-        rule: ?mapper_mod.NamingRule,
+        rules: []const mapper_mod.NamingRule,
     ) !TransformEngine {
-        const rules: []const mapper_mod.NamingRule = if (rule) |r|
-            &[_]mapper_mod.NamingRule{r}
-        else
-            &[_]mapper_mod.NamingRule{};
         var mp = try mapper_mod.Mapper.fromSchema(allocator, source_columns, rules);
         errdefer mp.deinit();
 
@@ -276,6 +272,7 @@ pub const TransformEngine = struct {
                 .filter_op = cfg.filter_op,
                 .filter_value = if (cfg.filter_value) |v| try allocator.dupe(u8, v) else null,
                 .naming_rule = try dupNamingRule(allocator, cfg.naming_rule),
+                .naming_rules = try dupNamingRules(allocator, cfg.naming_rules),
             },
             .mapper = mp,
             .calculator = commission_mod.Calculator.init(allocator),
@@ -511,7 +508,7 @@ test "TransformEngine.initWithSchema generates identity mappings" {
         .{ .name = "order_id" },
         .{ .name = "amount" },
     };
-    var eng = try TransformEngine.initWithSchema(a, cfg, &cols, null);
+    var eng = try TransformEngine.initWithSchema(a, cfg, &cols, &[_]mapper_mod.NamingRule{});
     defer eng.deinit();
     try std.testing.expectEqual(@as(usize, 2), eng.mapper.mappings.len);
     try std.testing.expectEqualStrings("order_id", eng.mapper.mappings[0].source);
@@ -530,7 +527,7 @@ test "TransformEngine.initWithSchema merges user overrides" {
         .{ .name = "order_id" },
         .{ .name = "amount" },
     };
-    var eng = try TransformEngine.initWithSchema(a, cfg, &cols, null);
+    var eng = try TransformEngine.initWithSchema(a, cfg, &cols, &[_]mapper_mod.NamingRule{});
     defer eng.deinit();
     try std.testing.expectEqual(@as(usize, 2), eng.mapper.mappings.len);
     try std.testing.expectEqualStrings("id", eng.mapper.mappings[0].target);
@@ -546,7 +543,7 @@ test "TransformEngine.initWithSchema applies naming_rule camel_to_snake" {
         .{ .name = "orderId" },
         .{ .name = "paidAt" },
     };
-    var eng = try TransformEngine.initWithSchema(a, cfg, &cols, .camel_to_snake);
+    var eng = try TransformEngine.initWithSchema(a, cfg, &cols, &[_]mapper_mod.NamingRule{.camel_to_snake});
     defer eng.deinit();
     try std.testing.expectEqual(@as(usize, 2), eng.mapper.mappings.len);
     try std.testing.expectEqualStrings("orderId", eng.mapper.mappings[0].source);
