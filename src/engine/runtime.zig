@@ -31,6 +31,14 @@ pub const BinlogStartPos = struct {
     pos: i64,
 };
 
+/// SyncTask 生命周期状态. 所有转换通过 atomic.Value 在 SyncTask 结构体内同步.
+pub const TaskStatus = enum(u8) {
+    pending = 0,
+    running = 1,
+    success = 2,
+    @"error" = 3,
+};
+
 pub const SyncTask = struct {
     allocator: std.mem.Allocator,
     cfg: RuntimeConfig,
@@ -46,16 +54,22 @@ pub const SyncTask = struct {
     _sp: []u8, // 持有 src DBConfig 的 dupe'd 字符串
     /// binlog CDC 用的源库 DB 连接 (P2 Task 11 注入, 当前为 null).
     binlog_db: ?zfinal.DB = null,
-    is_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// runLoop 退出后置 true, 供 stopAll 提前结束等待.
+    /// 当前任务状态. 所有转换: start → running, runLoop 退出 → success/error.
+    state: std.atomic.Value(TaskStatus) = std.atomic.Value(TaskStatus).init(.pending),
+    /// stop() 翻转此标志, runLoop 检测后优雅退出. 与 state 字段独立 (state 是结果, 这是原因).
+    should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// runLoop 退出后置 true, 供 stopAll 提前结束等待. 与 state 区分: state=结果, is_finished=过程完成.
     is_finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// deinit() 幂等保护: 多次调用只生效一次.
+    _deinit_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// src_pool.deinit() 幂等保护: zfinal ConnectionPool 二次 deinit 会 crash.
+    _pool_deinit_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 上次成功加载佣金规则的 Unix 时间 (秒). 0 = 从未成功加载过.
     /// 用于 stale-retry: 归集库恢复后, 每隔 rules_max_age_sec 再尝试拉一次.
     last_rules_loaded_at: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     /// 规则过期阈值 (秒). 默认 300s = 5 min. 0 = 每次同步都重新加载.
     rules_max_age_sec: i64 = 300,
     pos: meta.position.SyncPosition,
-    status: i32 = 1,
     last_error: ?[]const u8 = null,
     thread: ?std.Thread = null,
 
@@ -89,12 +103,30 @@ pub const SyncTask = struct {
     }
 
     pub fn deinit(self: *SyncTask) void {
+        // 幂等: 第二次调用直接返回.
+        if (self._deinit_done.swap(true, .acq_rel)) return;
+
+        // 如果仍在 running, 触发 stop 并 join.
+        const current = self.state.load(.acquire);
+        if (current == .running) {
+            self.should_stop.store(true, .release);
+            if (self.thread) |t| {
+                t.join();
+                self.thread = null;
+            }
+            // CAS: only transition if worker didn't already write a terminal state
+            // (e.g. .@"error" from a catch block). cmpxchgStrong(.running, .success, ...)
+            // silently no-ops if state has moved to success/err already.
+            const prev = self.state.cmpxchgStrong(.running, .success, .acq_rel, .acquire);
+            _ = prev; // return value intentionally ignored
+        }
+
         self.transformer.deinit();
         self.sink.deinit();
-        // src_pool 由 ConnectionPool.init 在内部 self-destroy, 外部只需 deinit.
-        self.src_pool.deinit();
-        // binlog_db 必须在 _sh/_sd/_su/_sp 释放前 deinit — MySQL driver 不持有外部字符串引用,
-        // 但顺序上保持 deinit 早于堆字符串释放更安全 (后续若 driver 变化).
+        // src_pool 双重 deinit 会段错误 (zfinal ConnectionPool 内部 self-destroy).
+        if (!self._pool_deinit_done.swap(true, .acq_rel)) {
+            self.src_pool.deinit();
+        }
         if (self.binlog_db) |*bd| bd.deinit();
         self.allocator.free(self._sh);
         self.allocator.free(self._sd);
@@ -105,17 +137,34 @@ pub const SyncTask = struct {
     }
 
     pub fn start(self: *SyncTask) !void {
-        if (self.is_running.load(.acquire)) return;
-        self.is_running.store(true, .release);
+        // 允许从 pending / success / @"error" 重新启动; 若 state == .running 则返回 error.AlreadyRunning.
+        // cmpxchgStrong 在 Zig 中返回 ?T (成功 = 旧值, 失败 = null), 所以用 load + CAS 重试模式.
+        while (true) {
+            const current = self.state.load(.acquire);
+            switch (current) {
+                .running => return error.AlreadyRunning,
+                .pending, .success, .@"error" => {
+                    if (self.state.cmpxchgStrong(current, .running, .acq_rel, .acquire) != null) break;
+                    // CAS 失败: 状态被并发改动, 重试.
+                },
+            }
+        }
+        self.should_stop.store(false, .release);
+        self.is_finished.store(false, .release);
+        if (self.last_error) |old| {
+            self.allocator.free(old);
+            self.last_error = null;
+        }
         self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
     }
 
     pub fn stop(self: *SyncTask) void {
-        self.is_running.store(false, .release);
+        self.should_stop.store(true, .release);
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
+        // 不修改 state — runLoop 退出时根据自身结果置 success/err.
     }
 
     fn runLoop(self: *SyncTask) void {
@@ -123,6 +172,11 @@ pub const SyncTask = struct {
         defer {
             common.logger.inf("[task {d}] 退出", .{self.cfg.task_id});
             self.is_finished.store(true, .release);
+            // 主路径 (runLoop 自身正常返回, 未被 stop 干预且 catch 块未 markError)
+            // → success. 错误路径已经在 catch 块 markError.
+            if (self.state.load(.acquire) == .running) {
+                self.markSuccess();
+            }
         }
 
         // 启动时 / 全量后尝试加载佣金规则; enable_commission_calc 为 true 才需要.
@@ -141,7 +195,7 @@ pub const SyncTask = struct {
         }
 
         // 2. 增量阶段 (按 sync_mode 分发)
-        if (!self.is_running.load(.acquire)) return;
+        if (self.should_stop.load(.acquire)) return;
 
         // 增量阶段
         switch (self.cfg.sync_mode) {
@@ -169,7 +223,7 @@ pub const SyncTask = struct {
         common.logger.inf("[task {d}] 全量 pk='{s}'", .{ self.cfg.task_id, self.pos.last_pk });
         var last = try self.allocator.dupe(u8, if (self.pos.last_pk.len > 0) self.pos.last_pk else "0");
         defer self.allocator.free(last);
-        while (self.is_running.load(.acquire)) {
+        while (!self.should_stop.load(.acquire)) {
             const rows = try self.poller.fetchFullBatch(last);
             if (rows.len == 0) {
                 common.logger.inf("[task {d}] 全量完成", .{self.cfg.task_id});
@@ -200,7 +254,7 @@ pub const SyncTask = struct {
         defer self.allocator.free(last_ut);
         var last_pk = try self.allocator.dupe(u8, if (self.pos.last_pk.len > 0) self.pos.last_pk else "0");
         defer self.allocator.free(last_pk);
-        while (self.is_running.load(.acquire)) {
+        while (!self.should_stop.load(.acquire)) {
             const rows = try self.poller.fetchIncrementalBatch(last_ut, last_pk);
             if (rows.len > 0) {
                 const next_ut = try self.allocator.dupe(u8, rows[rows.len - 1].fields.get(self.cfg.update_time_column) orelse "");
@@ -250,7 +304,7 @@ pub const SyncTask = struct {
         var parser = cdc.binlog.parser.Parser.init(self.allocator);
         defer parser.deinit();
 
-        while (self.is_running.load(.acquire)) {
+        while (!self.should_stop.load(.acquire)) {
             const raw = reader.nextEvent() catch |err| {
                 common.logger.err_("[task {d}] binlog fetch: {s}", .{ self.cfg.task_id, @errorName(err) });
                 sleepMs(1000);
@@ -409,8 +463,12 @@ pub const SyncTask = struct {
         self.loadRules();
     }
 
+    fn markSuccess(self: *SyncTask) void {
+        self.state.store(.success, .release);
+    }
+
     fn markError(self: *SyncTask, msg: []const u8) void {
-        self.status = 2;
+        self.state.store(.@"error", .release);
         if (self.last_error) |e| self.allocator.free(e);
         self.last_error = self.allocator.dupe(u8, msg) catch null;
         meta.task.Service.updateStatus(self.store, self.cfg.task_id, 2, msg) catch {};
@@ -427,4 +485,57 @@ fn curTs() i64 {
     var tv: std.c.timeval = undefined;
     if (std.c.gettimeofday(&tv, null) != 0) return 0;
     return @intCast(tv.sec);
+}
+
+// ============================================================================
+// 单元测试 — TaskStatus 状态机 + 原子字段语义 + 幂等 deinit 保护
+// P2 任务 6 (2026-06-19)
+// ============================================================================
+
+test "TaskStatus enum variants stringify correctly" {
+    try std.testing.expectEqualStrings("pending", @tagName(TaskStatus.pending));
+    try std.testing.expectEqualStrings("running", @tagName(TaskStatus.running));
+    try std.testing.expectEqualStrings("success", @tagName(TaskStatus.success));
+    // @"error" 在 Zig 中仅是保留字转义, @tagName 返回纯标识符 "error"
+    try std.testing.expectEqualStrings("error", @tagName(TaskStatus.@"error"));
+}
+
+test "atomic state field transitions: pending -> running -> success" {
+    var state = std.atomic.Value(TaskStatus).init(.pending);
+    try std.testing.expectEqual(TaskStatus.pending, state.load(.acquire));
+
+    state.store(.running, .release);
+    try std.testing.expectEqual(TaskStatus.running, state.load(.acquire));
+
+    state.store(.success, .release);
+    try std.testing.expectEqual(TaskStatus.success, state.load(.acquire));
+}
+
+test "atomic state field transitions: pending -> running -> error" {
+    var state = std.atomic.Value(TaskStatus).init(.pending);
+    state.store(.running, .release);
+    state.store(.@"error", .release);
+    try std.testing.expectEqual(TaskStatus.@"error", state.load(.acquire));
+}
+
+test "should_stop atomic flag toggles independently" {
+    var flag = std.atomic.Value(bool).init(false);
+    try std.testing.expectEqual(false, flag.load(.acquire));
+    flag.store(true, .release);
+    try std.testing.expectEqual(true, flag.load(.acquire));
+    flag.store(false, .release);
+    try std.testing.expectEqual(false, flag.load(.acquire));
+}
+
+test "_deinit_done flag is single-shot" {
+    var flag = std.atomic.Value(bool).init(false);
+    try std.testing.expectEqual(false, flag.swap(true, .acq_rel));
+    try std.testing.expectEqual(true, flag.swap(true, .acq_rel));
+    try std.testing.expectEqual(true, flag.load(.acquire));
+}
+
+test "_pool_deinit_done flag is single-shot" {
+    var flag = std.atomic.Value(bool).init(false);
+    try std.testing.expectEqual(false, flag.swap(true, .acq_rel));
+    try std.testing.expectEqual(true, flag.load(.acquire));
 }
