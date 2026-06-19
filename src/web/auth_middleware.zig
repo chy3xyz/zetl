@@ -154,6 +154,20 @@ test "isPublicPath" {
     try std.testing.expect(!isPublicPath("/api/v1/task/list"));
 }
 
+test "isPublicPath returns false for /api/tasks endpoints" {
+    try std.testing.expect(!isPublicPath("/api/tasks"));
+    try std.testing.expect(!isPublicPath("/api/tasks/1"));
+    try std.testing.expect(!isPublicPath("/api/tasks/1/reload"));
+    try std.testing.expect(!isPublicPath("/api/v1/task"));
+    try std.testing.expect(!isPublicPath("/api/v1/task/1/start"));
+}
+
+test "isPublicPath returns true for known public paths" {
+    try std.testing.expect(isPublicPath("/health"));
+    try std.testing.expect(isPublicPath("/api/v1/auth/login"));
+    try std.testing.expect(isPublicPath("/api/v1/auth/logout"));
+}
+
 test "permissionInterceptor: factory creates interceptor with correct name" {
     const intc = permissionInterceptor("datasource:write");
     try std.testing.expectEqualStrings("perm:datasource:write", intc.name);
