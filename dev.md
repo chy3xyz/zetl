@@ -94,3 +94,14 @@ HTTP API:
 - `TransformEngine.initWithSchema(...)`: 新入口, 调 fromSchema 后 mergeOverrides.
 - `SyncTask.runFull` 启动时通过 `SHOW COLUMNS FROM <table>` 获取 source 列名, 自动使用 `initWithSchema`.
 - binlog 路径继续使用 parser 的现有列名 ("c0", "c1", ...); 真实列名映射留 Phase 6b (TABLE_MAP metadata).
+
+## Phase 7: sink 自动化
+
+`MySqlSink.ensureTargetTable` 自动通过 `CREATE TABLE IF NOT EXISTS` 创建 target_table, 用户添加新表同步时无需手工建表.
+
+- `src/sink/schema_ddl.zig::buildCreateTable` 从 `[]ColumnMeta` 生成 DDL, 类型字节 → MySQL 类型字符串映射 (21 种类型 + TEXT 兜底).
+- `MySqlSink.ensureTargetTable` 执行 DDL, 表已存在时幂等 (IF NOT EXISTS).
+- `SyncTask.init` 在 `initWithSchema` 之后调用 `ensureTargetTable`; 失败时 warn + 继续 (假设 target 表已存在).
+- 默认 charset utf8mb4 + engine InnoDB; target_db 可选.
+- binlog / poll 路径自动复用 Phase 6 的 source schema.
+- 已知限制: VARCHAR / CHAR 长度、DECIMAL precision/scale 用默认值; 后续 Phase 7b 支持从 source metadata 推断.
