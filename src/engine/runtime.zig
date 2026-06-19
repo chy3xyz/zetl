@@ -386,6 +386,39 @@ pub const SyncTask = struct {
         return error.MissingMasterStatus;
     }
 
+    /// 通过 SHOW COLUMNS FROM <table> 获取 source 列名, 转 ColumnMeta 列表.
+    /// 调用方负责 free 返回的 slice 和每个 ColumnMeta.name 字符串.
+    /// zfinal ConnectionPool 没有 rowCount(), 故用 ArrayList 动态收集, 结束 toOwnedSlice.
+    pub fn fetchSourceColumns(self: *SyncTask) ![]transform.mapper.ColumnMeta {
+        const conn = try self.src_pool.acquire();
+        defer self.src_pool.release(conn) catch {};
+
+        const sql = try std.fmt.allocPrint(self.allocator, "SHOW COLUMNS FROM `{s}`", .{self._sh});
+        defer self.allocator.free(sql);
+
+        var result = conn.query(sql) catch |err| {
+            common.logger.err_("[task {d}] SHOW COLUMNS FROM {s}: {s}", .{ self.cfg.task_id, self._sh, @errorName(err) });
+            return err;
+        };
+        defer result.deinit();
+
+        var list = std.ArrayList(transform.mapper.ColumnMeta).empty;
+        errdefer {
+            for (list.items) |*c| self.allocator.free(c.name);
+            list.deinit(self.allocator);
+        }
+
+        while (try result.next()) {
+            const row = result.getCurrentRowMap() orelse continue;
+            const field_name = row.get("Field") orelse return error.MissingColumnName;
+            try list.append(self.allocator, .{
+                .name = try self.allocator.dupe(u8, field_name),
+            });
+        }
+
+        return list.toOwnedSlice(self.allocator);
+    }
+
     fn savePosition(self: *SyncTask) !void {
         try meta.position.Service.save(self.store, self.pos);
     }
