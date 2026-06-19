@@ -138,7 +138,11 @@ pub const TransformEngine = struct {
         source_columns: []const mapper_mod.ColumnMeta,
         rule: ?mapper_mod.NamingRule,
     ) !TransformEngine {
-        var mp = try mapper_mod.Mapper.fromSchema(allocator, source_columns, rule);
+        const rules: []const mapper_mod.NamingRule = if (rule) |r|
+            &[_]mapper_mod.NamingRule{r}
+        else
+            &[_]mapper_mod.NamingRule{};
+        var mp = try mapper_mod.Mapper.fromSchema(allocator, source_columns, rules);
         errdefer mp.deinit();
 
         if (cfg.field_mappings_json) |fm| {
