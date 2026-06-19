@@ -19,6 +19,87 @@ pub const ColumnMeta = struct {
     type: u8 = 0,
 };
 
+pub const NamingRule = union(enum) {
+    identity,
+    camel_to_snake,
+    snake_to_camel,
+    upper,
+    lower,
+    add_prefix: []const u8,
+    strip_prefix: []const u8,
+};
+
+pub fn applyNamingRule(rule: NamingRule, source: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    return switch (rule) {
+        .identity => allocator.dupe(u8, source),
+        .camel_to_snake => camelToSnake(allocator, source),
+        .snake_to_camel => snakeToCamel(allocator, source),
+        .upper => upperStr(allocator, source),
+        .lower => lowerStr(allocator, source),
+        .add_prefix => |prefix| std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, source }),
+        .strip_prefix => |prefix| stripPrefix(allocator, prefix, source),
+    };
+}
+
+fn upperStr(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var buf = try allocator.alloc(u8, s.len);
+    for (s, 0..) |c, i| buf[i] = std.ascii.toUpper(c);
+    return buf;
+}
+
+fn lowerStr(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var buf = try allocator.alloc(u8, s.len);
+    for (s, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    return buf;
+}
+
+fn camelToSnake(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+    var buf = try allocator.alloc(u8, source.len * 2);
+    var out_idx: usize = 0;
+    var i: usize = 0;
+    while (i < source.len) : (i += 1) {
+        const c = source[i];
+        const is_upper = c >= 'A' and c <= 'Z';
+        if (is_upper and i > 0 and out_idx > 0) {
+            buf[out_idx] = '_';
+            out_idx += 1;
+        }
+        buf[out_idx] = std.ascii.toLower(c);
+        out_idx += 1;
+    }
+    return allocator.realloc(buf, out_idx);
+}
+
+fn snakeToCamel(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+    var buf = try allocator.alloc(u8, source.len);
+    var out_idx: usize = 0;
+    var at_word_start = true;
+    for (source) |c| {
+        if (c == '_') {
+            at_word_start = true;
+        } else if (at_word_start) {
+            if (out_idx == 0) {
+                buf[out_idx] = std.ascii.toLower(c);
+            } else {
+                buf[out_idx] = std.ascii.toUpper(c);
+            }
+            out_idx += 1;
+            at_word_start = false;
+        } else {
+            buf[out_idx] = c;
+            out_idx += 1;
+        }
+    }
+    return allocator.realloc(buf, out_idx);
+}
+
+fn stripPrefix(allocator: std.mem.Allocator, prefix: []const u8, source: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, source, prefix)) {
+        return allocator.dupe(u8, source[prefix.len..]);
+    }
+    return allocator.dupe(u8, source);
+}
+
 pub const Mapper = struct {
     allocator: std.mem.Allocator,
     mappings: []FieldMapping = &.{},
@@ -343,4 +424,67 @@ test "Mapper.mergeOverrides appends user-only mappings" {
     try std.testing.expectEqualStrings("y", m.mappings[0].target);
     try std.testing.expectEqualStrings("z", m.mappings[1].source);
     try std.testing.expectEqualStrings("z_out", m.mappings[1].target);
+}
+
+test "applyNamingRule identity" {
+    const a = std.testing.allocator;
+    const out = try applyNamingRule(.identity, "order_id", a);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("order_id", out);
+}
+
+test "applyNamingRule camel_to_snake converts orderId to order_id" {
+    const a = std.testing.allocator;
+    const out = try applyNamingRule(.camel_to_snake, "orderId", a);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("order_id", out);
+}
+
+test "applyNamingRule camel_to_snake handles consecutive capitals" {
+    const a = std.testing.allocator;
+    const out = try applyNamingRule(.camel_to_snake, "userIDNumber", a);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("user_i_d_number", out);
+}
+
+test "applyNamingRule snake_to_camel converts order_id to orderId" {
+    const a = std.testing.allocator;
+    const out = try applyNamingRule(.snake_to_camel, "order_id", a);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("orderId", out);
+}
+
+test "applyNamingRule upper converts to UPPER" {
+    const a = std.testing.allocator;
+    const out = try applyNamingRule(.upper, "foo", a);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("FOO", out);
+}
+
+test "applyNamingRule lower converts to lower" {
+    const a = std.testing.allocator;
+    const out = try applyNamingRule(.lower, "FOO", a);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("foo", out);
+}
+
+test "applyNamingRule add_prefix prepends" {
+    const a = std.testing.allocator;
+    const out = try applyNamingRule(.{ .add_prefix = "dt_" }, "id", a);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("dt_id", out);
+}
+
+test "applyNamingRule strip_prefix removes matching prefix" {
+    const a = std.testing.allocator;
+    const out = try applyNamingRule(.{ .strip_prefix = "dt_" }, "dt_id", a);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("id", out);
+}
+
+test "applyNamingRule strip_prefix returns original if no match" {
+    const a = std.testing.allocator;
+    const out = try applyNamingRule(.{ .strip_prefix = "dt_" }, "id", a);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("id", out);
 }
