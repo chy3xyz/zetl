@@ -44,58 +44,171 @@ pub const TransformConfig = struct {
     /// 需要调用 deinit(allocator) 释放.
     naming_rule: ?mapper_mod.NamingRule = null,
 
-    /// 释放 naming_rule 的 add_prefix / strip_prefix prefix slice.
+    /// Phase 6c: 链式命名规则 (数组形式). 与 naming_rule 互不冲突;
+    /// initWithSchema 优先用 rules 切片, 退回到单 rule.
+    /// 数组中带堆内存的变体 (add_prefix / strip_prefix / regex_replace)
+    /// 由 cfg 拥有, 需要调用 deinit(allocator) 释放.
+    naming_rules: []const mapper_mod.NamingRule = &.{},
+
+    /// 释放 naming_rule 与 naming_rules 中所有堆拥有 slice.
     /// 其他变体 (identity / camel_to_snake / snake_to_camel / upper / lower)
     /// 无堆内存, 不需要 free.
-    pub fn deinit(self: *TransformConfig, allocator: std.mem.Allocator) void {
-        if (self.naming_rule) |rule| {
-            switch (rule) {
-                .add_prefix => |p| allocator.free(p),
-                .strip_prefix => |p| allocator.free(p),
-                else => {},
+    /// 注意: 默认 naming_rules = &.{} (静态零长度), 不归 cfg 拥有, 不释放.
+    /// 只有 initFromJson / dupNamingRules 产生的 len > 0 切片才被释放.
+    pub fn deinit(self: *const TransformConfig, allocator: std.mem.Allocator) void {
+        freeRule(allocator, self.naming_rule);
+        for (self.naming_rules) |rule| freeRule(allocator, rule);
+        if (self.naming_rules.len > 0) {
+            allocator.free(self.naming_rules);
+        }
+    }
+
+    /// 从 std.json.Value 解析 transform config.
+    /// 期望顶层为 { "transform": { ... } } 对象;
+    /// transform 内可选字段: `naming_rule` (string / object) 与 `naming_rules` (array).
+    /// 未识别 / 缺失字段静默降级, 不报错.
+    pub fn initFromJson(allocator: std.mem.Allocator, value: std.json.Value) !TransformConfig {
+        var cfg = TransformConfig{
+            .mall_id = "",
+        };
+        errdefer cfg.deinit(allocator);
+
+        const transform_val = switch (value) {
+            .object => |o| o.get("transform") orelse return cfg,
+            else => return cfg,
+        };
+        if (transform_val != .object) return cfg;
+        const transform = transform_val.object;
+
+        // naming_rule (单规则, 兼容 Phase 6b)
+        if (transform.get("naming_rule")) |nrv| {
+            cfg.naming_rule = try parseNamingRule(nrv, allocator);
+        }
+
+        // naming_rules (数组形式 pipeline)
+        if (transform.get("naming_rules")) |nrv| {
+            if (nrv == .array) {
+                const items = nrv.array.items;
+                const parsed = try allocator.alloc(mapper_mod.NamingRule, items.len);
+                var parsed_count: usize = 0;
+                errdefer {
+                    for (parsed[0..parsed_count]) |r| freeRule(allocator, r);
+                    allocator.free(parsed);
+                }
+                for (items, 0..) |item, i| {
+                    const rule_opt = try parseSingleNamingRule(item, allocator);
+                    const rule = rule_opt orelse return error.InvalidNamingRule;
+                    parsed[i] = rule;
+                    parsed_count = i + 1;
+                }
+                cfg.naming_rules = parsed;
             }
         }
+
+        return cfg;
     }
 };
 
-/// 复制 naming_rule, 让 cfg 拥有 prefix slice.
+/// 释放单条 NamingRule 中可能持有的堆 slice.
+fn freeRule(allocator: std.mem.Allocator, rule_opt: ?mapper_mod.NamingRule) void {
+    const rule = rule_opt orelse return;
+    switch (rule) {
+        .add_prefix => |p| allocator.free(p),
+        .strip_prefix => |p| allocator.free(p),
+        .regex_replace => |rr| {
+            allocator.free(rr.pattern);
+            allocator.free(rr.replacement);
+        },
+        else => {},
+    }
+}
+
+/// 复制单条 naming_rule, 让 cfg 拥有 prefix / pattern / replacement slice.
 fn dupNamingRule(allocator: std.mem.Allocator, rule: ?mapper_mod.NamingRule) !?mapper_mod.NamingRule {
     const r = rule orelse return null;
     return switch (r) {
         .add_prefix => |p| .{ .add_prefix = try allocator.dupe(u8, p) },
         .strip_prefix => |p| .{ .strip_prefix = try allocator.dupe(u8, p) },
+        .regex_replace => |rr| .{ .regex_replace = .{
+            .pattern = try allocator.dupe(u8, rr.pattern),
+            .replacement = try allocator.dupe(u8, rr.replacement),
+        } },
         else => r,
     };
 }
 
-/// 解析 std.json.Value 形式的 naming_rule.
-/// 接受 string 简写 ("identity" / "camel_to_snake" / "snake_to_camel" / "upper" / "lower")
-/// 或对象 { "type": "add_prefix"|"strip_prefix", "value": "<prefix>" }.
-/// 未知 / 缺失字段 → null (降级, 不报错).
-fn parseNamingRule(value: std.json.Value, allocator: std.mem.Allocator) !?mapper_mod.NamingRule {
-    switch (value) {
-        .string => |s| {
-            if (std.mem.eql(u8, s, "identity")) return .identity;
-            if (std.mem.eql(u8, s, "camel_to_snake")) return .camel_to_snake;
-            if (std.mem.eql(u8, s, "snake_to_camel")) return .snake_to_camel;
-            if (std.mem.eql(u8, s, "upper")) return .upper;
-            if (std.mem.eql(u8, s, "lower")) return .lower;
-            return null;
-        },
+/// 复制整个 naming_rules 数组, 让 cfg 拥有所有 slice.
+fn dupNamingRules(allocator: std.mem.Allocator, src: []const mapper_mod.NamingRule) ![]const mapper_mod.NamingRule {
+    const out = try allocator.alloc(mapper_mod.NamingRule, src.len);
+    var copied: usize = 0;
+    errdefer {
+        for (out[0..copied]) |r| freeRule(allocator, r);
+        allocator.free(out);
+    }
+    for (src, 0..) |rule, i| {
+        out[i] = try dupNamingRule(allocator, rule) orelse rule;
+        copied = i + 1;
+    }
+    return out;
+}
+
+/// 解析单条 naming_rule (string 简写或 {type,...} 对象).
+/// 接受 string ("identity" / "camel_to_snake" / "snake_to_camel" / "upper" / "lower")
+/// 或对象 { "type": "<rule_type>", ... } 其中 rule_type 覆盖所有变体:
+///   "identity" / "camel_to_snake" / "snake_to_camel" / "upper" / "lower" (无需 value)
+///   "add_prefix" / "strip_prefix" (需要 "value": "<prefix>")
+///   "regex_replace" (需要 "pattern" + "replacement")
+/// 未知 / 缺失字段 → null (降级).
+fn parseSingleNamingRule(value: std.json.Value, allocator: std.mem.Allocator) !?mapper_mod.NamingRule {
+    return switch (value) {
+        .string => |s| return typeStrToRule(s),
         .object => |o| {
             const t = o.get("type") orelse return null;
             if (t != .string) return null;
-            const v = o.get("value") orelse return null;
-            if (v != .string) return null;
-            const value_str = try allocator.dupe(u8, v.string);
-            errdefer allocator.free(value_str);
-            if (std.mem.eql(u8, t.string, "add_prefix")) return .{ .add_prefix = value_str };
-            if (std.mem.eql(u8, t.string, "strip_prefix")) return .{ .strip_prefix = value_str };
-            allocator.free(value_str);
-            return null;
+            const type_str = t.string;
+            if (std.mem.eql(u8, type_str, "add_prefix")) {
+                const v = o.get("value") orelse return null;
+                if (v != .string) return null;
+                const value_str = try allocator.dupe(u8, v.string);
+                errdefer allocator.free(value_str);
+                return .{ .add_prefix = value_str };
+            }
+            if (std.mem.eql(u8, type_str, "strip_prefix")) {
+                const v = o.get("value") orelse return null;
+                if (v != .string) return null;
+                const value_str = try allocator.dupe(u8, v.string);
+                errdefer allocator.free(value_str);
+                return .{ .strip_prefix = value_str };
+            }
+            if (std.mem.eql(u8, type_str, "regex_replace")) {
+                const p = o.get("pattern") orelse return null;
+                if (p != .string) return null;
+                const r = o.get("replacement") orelse return null;
+                if (r != .string) return null;
+                const pat = try allocator.dupe(u8, p.string);
+                errdefer allocator.free(pat);
+                const rep = try allocator.dupe(u8, r.string);
+                return .{ .regex_replace = .{ .pattern = pat, .replacement = rep } };
+            }
+            return typeStrToRule(type_str);
         },
         else => return null,
-    }
+    };
+}
+
+/// 映射 parameterless rule 名字符串到 NamingRule. 未知返回 null.
+fn typeStrToRule(s: []const u8) ?mapper_mod.NamingRule {
+    if (std.mem.eql(u8, s, "identity")) return .identity;
+    if (std.mem.eql(u8, s, "camel_to_snake")) return .camel_to_snake;
+    if (std.mem.eql(u8, s, "snake_to_camel")) return .snake_to_camel;
+    if (std.mem.eql(u8, s, "upper")) return .upper;
+    if (std.mem.eql(u8, s, "lower")) return .lower;
+    return null;
+}
+
+/// 顶层 alias, 保持 Phase 6b 既有测试可用.
+fn parseNamingRule(value: std.json.Value, allocator: std.mem.Allocator) !?mapper_mod.NamingRule {
+    return parseSingleNamingRule(value, allocator);
 }
 
 pub const FilterOp = enum { eq, ne, gt, gte, lt, lte };
@@ -506,4 +619,40 @@ test "TransformConfig.deinit frees add_prefix slice without leak" {
     };
     cfg.deinit(a);
     cfg.naming_rule = null; // deinit 后置 null, 防止之后误用
+}
+
+test "TransformConfig parses naming_rules array from json" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"transform":{"naming_rules":[
+        \\  {"type":"camel_to_snake"},
+        \\  {"type":"add_prefix","value":"dt_"}
+        \\]}}
+    , .{});
+    defer parsed.deinit();
+
+    const cfg = try TransformConfig.initFromJson(a, parsed.value);
+    defer cfg.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), cfg.naming_rules.len);
+}
+
+test "TransformConfig parses regex_replace naming_rule from json" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"transform":{"naming_rules":[
+        \\  {"type":"regex_replace","pattern":"_tmp$","replacement":""}
+        \\]}}
+    , .{});
+    defer parsed.deinit();
+
+    const cfg = try TransformConfig.initFromJson(a, parsed.value);
+    defer cfg.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), cfg.naming_rules.len);
+    switch (cfg.naming_rules[0]) {
+        .regex_replace => |rr| {
+            try std.testing.expectEqualStrings("_tmp$", rr.pattern);
+            try std.testing.expectEqualStrings("", rr.replacement);
+        },
+        else => return error.UnexpectedRule,
+    }
 }
