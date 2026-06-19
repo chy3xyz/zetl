@@ -432,12 +432,50 @@ pub const SyncTask = struct {
         while (result.next()) {
             const row = result.getCurrentRowMap() orelse continue;
             const field_name = row.get("Field") orelse return error.MissingColumnName;
+            const type_str = row.get("Type") orelse "";
+            const type_byte = parseMySqlTypeString(type_str);
             try list.append(self.allocator, .{
                 .name = try self.allocator.dupe(u8, field_name),
+                .type = type_byte,
             });
         }
 
         return list.toOwnedSlice(self.allocator);
+    }
+
+    /// 解析 SHOW COLUMNS 返回的 Type 字符串 (如 "int(11) unsigned", "varchar(255)", "datetime")
+    /// 转 MySQL 类型字节. 未知类型返回 0xff (建表时 fallback TEXT, 由 schema_ddl.mySqlTypeName 处理).
+    fn parseMySqlTypeString(type_str: []const u8) u8 {
+        // 取括号 / 空格前的关键字部分 ("int(11) unsigned" -> "int", "datetime" -> "datetime").
+        var end: usize = 0;
+        while (end < type_str.len and type_str[end] != '(' and type_str[end] != ' ') : (end += 1) {}
+        const keyword = type_str[0..end];
+
+        if (std.mem.eql(u8, keyword, "tinyint")) return 0x01;
+        if (std.mem.eql(u8, keyword, "smallint")) return 0x02;
+        if (std.mem.eql(u8, keyword, "int")) return 0x03;
+        if (std.mem.eql(u8, keyword, "mediumint")) return 0x09;
+        if (std.mem.eql(u8, keyword, "bigint")) return 0x08;
+        if (std.mem.eql(u8, keyword, "float")) return 0x04;
+        if (std.mem.eql(u8, keyword, "double")) return 0x05;
+        if (std.mem.eql(u8, keyword, "decimal")) return 0xf6;
+        if (std.mem.eql(u8, keyword, "date")) return 0x0a;
+        if (std.mem.eql(u8, keyword, "time")) return 0x0b;
+        if (std.mem.eql(u8, keyword, "datetime")) return 0x12;
+        if (std.mem.eql(u8, keyword, "timestamp")) return 0x11;
+        if (std.mem.eql(u8, keyword, "year")) return 0x0d;
+        if (std.mem.eql(u8, keyword, "varchar")) return 0x0f;
+        if (std.mem.eql(u8, keyword, "char")) return 0xfe;
+        if (std.mem.eql(u8, keyword, "text")) return 0xfd;
+        if (std.mem.eql(u8, keyword, "tinytext")) return 0xfd;
+        if (std.mem.eql(u8, keyword, "mediumtext")) return 0xfd;
+        if (std.mem.eql(u8, keyword, "longtext")) return 0xfd;
+        if (std.mem.eql(u8, keyword, "blob")) return 0xfc;
+        if (std.mem.eql(u8, keyword, "tinyblob")) return 0xfc;
+        if (std.mem.eql(u8, keyword, "mediumblob")) return 0xfc;
+        if (std.mem.eql(u8, keyword, "longblob")) return 0xfc;
+        if (std.mem.eql(u8, keyword, "json")) return 0xf5;
+        return 0xff; // unknown -> schema_ddl fallback TEXT
     }
 
     fn savePosition(self: *SyncTask) !void {
