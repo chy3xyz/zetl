@@ -75,12 +75,32 @@ pub const SyncTask = struct {
 
     pub fn init(a: std.mem.Allocator, cfg: RuntimeConfig, ds: meta.datasource.Datasource, store: *meta.store.MetaStore, sp: *zfinal.ConnectionPool, src_pool: *zfinal.ConnectionPool, src_host: []u8, src_db: []u8, src_user: []u8, src_pass: []u8) !SyncTask {
         // TransformEngine / MySqlSink 会在内部复制需要的字符串, 这里直接传借用值.
-        const tr = try transform.engine.TransformEngine.init(a, .{
-            .mall_id = cfg.mall_id,
-            .source_type = "mysql",
-            .field_mappings_json = cfg.field_mappings_json,
-            .enable_commission_calc = cfg.enable_commission_calc,
-        });
+        // 尝试从 source 表获取列元数据, 用于自动生成 identity 映射. 失败时退化为手工 init.
+        const tr = tr_init: {
+            const engine_cfg: transform.engine.TransformConfig = .{
+                .mall_id = cfg.mall_id,
+                .source_type = "mysql",
+                .field_mappings_json = cfg.field_mappings_json,
+                .enable_commission_calc = cfg.enable_commission_calc,
+            };
+            // 临时 self 仅含 fetchSourceColumns 所需字段 (allocator, src_pool, _sh, cfg).
+            // SyncTask 尚未构造, 用 undefined 占位未访问字段, 仅设置本次调用会读的字段.
+            var tmp: SyncTask = undefined;
+            tmp.allocator = a;
+            tmp.cfg = cfg;
+            tmp.src_pool = src_pool;
+            tmp._sh = src_host;
+            if (tmp.fetchSourceColumns()) |cols| {
+                defer {
+                    for (cols) |c| a.free(c.name);
+                    a.free(cols);
+                }
+                break :tr_init try transform.engine.TransformEngine.initWithSchema(a, engine_cfg, cols);
+            } else |err| {
+                common.logger.warn("[task {d}] fetchSourceColumns 失败, 退化为手工映射: {s}", .{ cfg.task_id, @errorName(err) });
+                break :tr_init try transform.engine.TransformEngine.init(a, engine_cfg);
+            }
+        };
         const sk = sink_mod.mysql_sink.MySqlSink.init(a, sp, cfg.target_table, cfg.batch_size, "order_no");
         const po = try meta.position.Service.load(store, a, cfg.task_id);
         const pl_cfg = cdc.poller.PollerConfig.fromSlices(src_host, ds.port, src_user, src_pass, src_db, cfg.source_table, cfg.pk_column, cfg.update_time_column, @intCast(cfg.batch_size));
@@ -384,6 +404,40 @@ pub const SyncTask = struct {
             }
         }
         return error.MissingMasterStatus;
+    }
+
+    /// 通过 SHOW COLUMNS FROM <table> 获取 source 列名, 转 ColumnMeta 列表.
+    /// 调用方负责 free 返回的 slice 和每个 ColumnMeta.name 字符串.
+    /// zfinal ConnectionPool 没有 rowCount(), 故用 ArrayList 动态收集, 结束 toOwnedSlice.
+    pub fn fetchSourceColumns(self: *SyncTask) ![]transform.mapper.ColumnMeta {
+        const conn = try self.src_pool.acquire();
+        defer self.src_pool.release(conn) catch {};
+
+        // conn.query 要求 [:0]const u8 (null-terminated), allocPrintSentinel 返回的就是这种.
+        const sql = try std.fmt.allocPrintSentinel(self.allocator, "SHOW COLUMNS FROM `{s}`", .{self._sh}, 0);
+        defer self.allocator.free(sql);
+
+        var result = conn.query(sql) catch |err| {
+            common.logger.err_("[task {d}] SHOW COLUMNS FROM {s}: {s}", .{ self.cfg.task_id, self._sh, @errorName(err) });
+            return err;
+        };
+        defer result.deinit();
+
+        var list = std.ArrayList(transform.mapper.ColumnMeta).empty;
+        errdefer {
+            for (list.items) |*c| self.allocator.free(c.name);
+            list.deinit(self.allocator);
+        }
+
+        while (result.next()) {
+            const row = result.getCurrentRowMap() orelse continue;
+            const field_name = row.get("Field") orelse return error.MissingColumnName;
+            try list.append(self.allocator, .{
+                .name = try self.allocator.dupe(u8, field_name),
+            });
+        }
+
+        return list.toOwnedSlice(self.allocator);
     }
 
     fn savePosition(self: *SyncTask) !void {

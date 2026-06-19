@@ -12,6 +12,13 @@ pub const FieldMapping = struct {
     type_convert: ?[]const u8 = null,
 };
 
+/// Source schema 列元数据, 用于自动生成默认映射.
+pub const ColumnMeta = struct {
+    name: []const u8,
+    /// MySQL 类型常量 (可选, 暂未使用).
+    type: u8 = 0,
+};
+
 pub const Mapper = struct {
     allocator: std.mem.Allocator,
     mappings: []FieldMapping = &.{},
@@ -24,6 +31,76 @@ pub const Mapper = struct {
             if (m.type_convert) |t| self.allocator.free(t);
         }
         self.allocator.free(self.mappings);
+    }
+
+    /// 从 source 列元数据生成 identity 映射 (列名 == 列名).
+    pub fn fromSchema(allocator: std.mem.Allocator, columns: []const ColumnMeta) !Mapper {
+        var mappings = try allocator.alloc(FieldMapping, columns.len);
+        errdefer {
+            for (mappings) |m| {
+                allocator.free(m.source);
+                allocator.free(m.target);
+            }
+            allocator.free(mappings);
+        }
+        for (columns, 0..) |col, i| {
+            mappings[i] = .{
+                .source = try allocator.dupe(u8, col.name),
+                .target = try allocator.dupe(u8, col.name),
+            };
+        }
+        return Mapper{ .allocator = allocator, .mappings = mappings };
+    }
+
+    /// 用 user_json 中的覆盖项替换同 source 的 mapping.
+    /// user_json 格式与 fromJson 相同: [{"source": "...", "target": "...", "default": "...", "type": "..."}]
+    /// 已有的 auto mappings 中, 命中 source 的项的 target / default / type 被替换.
+    /// user_json 中 source 不在 auto 里的项作为额外 mapping 追加.
+    pub fn mergeOverrides(self: *Mapper, allocator: std.mem.Allocator, user_json: []const u8) !void {
+        if (user_json.len == 0) return;
+        var override_mapper = try fromJson(allocator, user_json);
+        defer override_mapper.deinit();
+
+        var idx = std.StringHashMap(usize).init(allocator);
+        defer idx.deinit();
+        for (override_mapper.mappings, 0..) |m, i| {
+            try idx.put(m.source, i);
+        }
+
+        for (self.mappings) |*auto_m| {
+            if (idx.get(auto_m.source)) |ov_idx| {
+                const ov = override_mapper.mappings[ov_idx];
+                allocator.free(auto_m.target);
+                auto_m.target = try allocator.dupe(u8, ov.target);
+                if (auto_m.default_value) |d| allocator.free(d);
+                auto_m.default_value = null;
+                if (ov.default_value) |d| auto_m.default_value = try allocator.dupe(u8, d);
+                if (auto_m.type_convert) |t| allocator.free(t);
+                auto_m.type_convert = null;
+                if (ov.type_convert) |t| auto_m.type_convert = try allocator.dupe(u8, t);
+            }
+        }
+
+        for (override_mapper.mappings) |ov| {
+            var found = false;
+            for (self.mappings) |auto_m| {
+                if (std.mem.eql(u8, auto_m.source, ov.source)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                var new_m: FieldMapping = .{
+                    .source = try allocator.dupe(u8, ov.source),
+                    .target = try allocator.dupe(u8, ov.target),
+                };
+                if (ov.default_value) |d| new_m.default_value = try allocator.dupe(u8, d);
+                if (ov.type_convert) |t| new_m.type_convert = try allocator.dupe(u8, t);
+                const new_list = try allocator.realloc(self.mappings, self.mappings.len + 1);
+                new_list[self.mappings.len] = new_m;
+                self.mappings = new_list;
+            }
+        }
     }
 
     /// 从 task.field_mappings (JSON 字符串) 解析
@@ -201,4 +278,69 @@ test "mapper: source field reuses underlying value" {
     }
     try std.testing.expectEqualStrings("42", target.get("id").?);
     try std.testing.expectEqualStrings("Alice", target.get("user_name").?);
+}
+
+test "Mapper.fromSchema generates identity mappings" {
+    const a = std.testing.allocator;
+    const cols = [_]ColumnMeta{
+        .{ .name = "order_id" },
+        .{ .name = "paid_at" },
+        .{ .name = "amount" },
+    };
+    var m = try Mapper.fromSchema(a, &cols);
+    defer m.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), m.mappings.len);
+    try std.testing.expectEqualStrings("order_id", m.mappings[0].source);
+    try std.testing.expectEqualStrings("order_id", m.mappings[0].target);
+    try std.testing.expectEqualStrings("paid_at", m.mappings[1].source);
+    try std.testing.expectEqualStrings("paid_at", m.mappings[1].target);
+    try std.testing.expectEqualStrings("amount", m.mappings[2].source);
+    try std.testing.expectEqualStrings("amount", m.mappings[2].target);
+}
+
+test "Mapper.mergeOverrides replaces target for matching source" {
+    const a = std.testing.allocator;
+    const cols = [_]ColumnMeta{
+        .{ .name = "order_id" },
+        .{ .name = "paid_at" },
+    };
+    var m = try Mapper.fromSchema(a, &cols);
+    defer m.deinit();
+
+    try m.mergeOverrides(a,
+        \\[{"source":"order_id","target":"id"}]
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), m.mappings.len);
+    try std.testing.expectEqualStrings("order_id", m.mappings[0].source);
+    try std.testing.expectEqualStrings("id", m.mappings[0].target);
+    try std.testing.expectEqualStrings("paid_at", m.mappings[1].target);
+}
+
+test "Mapper.mergeOverrides with empty json is no-op" {
+    const a = std.testing.allocator;
+    const cols = [_]ColumnMeta{.{ .name = "x" }};
+    var m = try Mapper.fromSchema(a, &cols);
+    defer m.deinit();
+    try m.mergeOverrides(a, "");
+    try std.testing.expectEqual(@as(usize, 1), m.mappings.len);
+    try std.testing.expectEqualStrings("x", m.mappings[0].target);
+}
+
+test "Mapper.mergeOverrides appends user-only mappings" {
+    const a = std.testing.allocator;
+    const cols = [_]ColumnMeta{.{ .name = "x" }};
+    var m = try Mapper.fromSchema(a, &cols);
+    defer m.deinit();
+
+    try m.mergeOverrides(a,
+        \\[{"source":"x","target":"y"},{"source":"z","target":"z_out"}]
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), m.mappings.len);
+    try std.testing.expectEqualStrings("x", m.mappings[0].source);
+    try std.testing.expectEqualStrings("y", m.mappings[0].target);
+    try std.testing.expectEqualStrings("z", m.mappings[1].source);
+    try std.testing.expectEqualStrings("z_out", m.mappings[1].target);
 }
