@@ -117,6 +117,7 @@ test {
     _ = @import("transform/commission.zig");
     _ = @import("transform/engine.zig");
     _ = @import("sink/mysql_sink.zig");
+    _ = @import("sink/schema_ddl.zig");
     _ = @import("web/auth_middleware.zig");
     _ = @import("reconcile/summary.zig");
     _ = @import("reconcile/handler.zig");

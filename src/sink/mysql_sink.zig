@@ -9,6 +9,8 @@
 const std = @import("std");
 const zfinal = @import("zfinal");
 const transform = @import("../transform/mod.zig");
+const mapper = @import("../transform/mapper.zig");
+const schema_ddl = @import("schema_ddl.zig");
 
 pub const ConflictStrategy = enum {
     ignore, // 冲突则忽略
@@ -52,6 +54,37 @@ pub const MySqlSink = struct {
         self.batch_buffer.deinit(self.allocator);
         self.allocator.free(self.target_table);
         self.allocator.free(self.unique_key);
+    }
+
+    /// 通过 CREATE TABLE IF NOT EXISTS 自动确保 target_table 存在.
+    /// 失败时返回 error 让调用方决定 warn or fail.
+    /// - pool: zfinal 连接池 (用于执行 DDL)
+    /// - target_table: 目标表名
+    /// - columns: 列元数据 (列名 + MySQL 类型字节)
+    /// - options: 可选 database 前缀, engine, charset
+    pub fn ensureTargetTable(
+        pool: *zfinal.ConnectionPool,
+        target_table: []const u8,
+        columns: []const mapper.ColumnMeta,
+        options: schema_ddl.DdlOptions,
+    ) !void {
+        const a = pool.allocator;
+        const ddl = try schema_ddl.buildCreateTable(a, target_table, columns, options);
+        defer a.free(ddl);
+
+        const conn = pool.acquire() catch return error.PoolExhausted;
+        defer pool.release(conn) catch {};
+
+        // exec 需要 [:0]const u8, 而 buildCreateTable 返回 []u8 — 复制为零结尾字符串
+        const ddl_z = try sentinelAlloc(a, ddl);
+        defer a.free(ddl_z);
+
+        conn.exec(ddl_z) catch |err| {
+            std.log.warn("ensureTargetTable failed for {s}: {s}", .{ target_table, @errorName(err) });
+            return err;
+        };
+
+        std.log.info("ensureTargetTable: ensured {s} exists", .{target_table});
     }
 
     /// 追加单行 (达 batch_size 自动 flush)
