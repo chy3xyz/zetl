@@ -38,7 +38,65 @@ pub const TransformConfig = struct {
     filter_field: ?[]const u8 = null,
     filter_op: FilterOp = .gte,
     filter_value: ?[]const u8 = null,
+    /// Phase 6b: 字段命名规则 (string 简写或 {type,value} 对象).
+    /// 作用于 initWithSchema 自动生成的 source→target 列名.
+    /// add_prefix / strip_prefix 变体的 prefix slice 由 caller 拥有,
+    /// 需要调用 deinit(allocator) 释放.
+    naming_rule: ?mapper_mod.NamingRule = null,
+
+    /// 释放 naming_rule 的 add_prefix / strip_prefix prefix slice.
+    /// 其他变体 (identity / camel_to_snake / snake_to_camel / upper / lower)
+    /// 无堆内存, 不需要 free.
+    pub fn deinit(self: *TransformConfig, allocator: std.mem.Allocator) void {
+        if (self.naming_rule) |rule| {
+            switch (rule) {
+                .add_prefix => |p| allocator.free(p),
+                .strip_prefix => |p| allocator.free(p),
+                else => {},
+            }
+        }
+    }
 };
+
+/// 复制 naming_rule, 让 cfg 拥有 prefix slice.
+fn dupNamingRule(allocator: std.mem.Allocator, rule: ?mapper_mod.NamingRule) !?mapper_mod.NamingRule {
+    const r = rule orelse return null;
+    return switch (r) {
+        .add_prefix => |p| .{ .add_prefix = try allocator.dupe(u8, p) },
+        .strip_prefix => |p| .{ .strip_prefix = try allocator.dupe(u8, p) },
+        else => r,
+    };
+}
+
+/// 解析 std.json.Value 形式的 naming_rule.
+/// 接受 string 简写 ("identity" / "camel_to_snake" / "snake_to_camel" / "upper" / "lower")
+/// 或对象 { "type": "add_prefix"|"strip_prefix", "value": "<prefix>" }.
+/// 未知 / 缺失字段 → null (降级, 不报错).
+fn parseNamingRule(value: std.json.Value, allocator: std.mem.Allocator) !?mapper_mod.NamingRule {
+    switch (value) {
+        .string => |s| {
+            if (std.mem.eql(u8, s, "identity")) return .identity;
+            if (std.mem.eql(u8, s, "camel_to_snake")) return .camel_to_snake;
+            if (std.mem.eql(u8, s, "snake_to_camel")) return .snake_to_camel;
+            if (std.mem.eql(u8, s, "upper")) return .upper;
+            if (std.mem.eql(u8, s, "lower")) return .lower;
+            return null;
+        },
+        .object => |o| {
+            const t = o.get("type") orelse return null;
+            if (t != .string) return null;
+            const v = o.get("value") orelse return null;
+            if (v != .string) return null;
+            const value_str = try allocator.dupe(u8, v.string);
+            errdefer allocator.free(value_str);
+            if (std.mem.eql(u8, t.string, "add_prefix")) return .{ .add_prefix = value_str };
+            if (std.mem.eql(u8, t.string, "strip_prefix")) return .{ .strip_prefix = value_str };
+            allocator.free(value_str);
+            return null;
+        },
+        else => return null,
+    }
+}
 
 pub const FilterOp = enum { eq, ne, gt, gte, lt, lte };
 
@@ -64,20 +122,23 @@ pub const TransformEngine = struct {
                 .filter_field = if (cfg.filter_field) |f| try allocator.dupe(u8, f) else null,
                 .filter_op = cfg.filter_op,
                 .filter_value = if (cfg.filter_value) |v| try allocator.dupe(u8, v) else null,
+                .naming_rule = try dupNamingRule(allocator, cfg.naming_rule),
             },
             .mapper = mapper,
             .calculator = commission_mod.Calculator.init(allocator),
         };
     }
 
-    /// 带 source schema 的 init. 先 fromSchema 生成 identity 映射, 再 mergeOverrides 应用用户覆盖.
+    /// 带 source schema 的 init. 先 fromSchema 应用命名规则生成初始映射, 再 mergeOverrides 应用用户覆盖.
+    /// `rule` 传给 Mapper.fromSchema: null = identity (默认); 非 null 时按 NamingRule 转换 source → target 列名.
     /// calculator 与 init 行为一致 (始终创建), enable_commission_calc 仅控制 process() 时是否启用.
     pub fn initWithSchema(
         allocator: std.mem.Allocator,
         cfg: TransformConfig,
         source_columns: []const mapper_mod.ColumnMeta,
+        rule: ?mapper_mod.NamingRule,
     ) !TransformEngine {
-        var mp = try mapper_mod.Mapper.fromSchema(allocator, source_columns);
+        var mp = try mapper_mod.Mapper.fromSchema(allocator, source_columns, rule);
         errdefer mp.deinit();
 
         if (cfg.field_mappings_json) |fm| {
@@ -97,6 +158,7 @@ pub const TransformEngine = struct {
                 .filter_field = if (cfg.filter_field) |f| try allocator.dupe(u8, f) else null,
                 .filter_op = cfg.filter_op,
                 .filter_value = if (cfg.filter_value) |v| try allocator.dupe(u8, v) else null,
+                .naming_rule = try dupNamingRule(allocator, cfg.naming_rule),
             },
             .mapper = mp,
             .calculator = commission_mod.Calculator.init(allocator),
@@ -112,6 +174,8 @@ pub const TransformEngine = struct {
         if (self.cfg.filter_condition) |f| self.allocator.free(f);
         if (self.cfg.filter_field) |f| self.allocator.free(f);
         if (self.cfg.filter_value) |v| self.allocator.free(v);
+        // 释放 naming_rule 的 add_prefix / strip_prefix prefix slice
+        self.cfg.deinit(self.allocator);
     }
 
     /// 设置佣金计算器规则
@@ -330,7 +394,7 @@ test "TransformEngine.initWithSchema generates identity mappings" {
         .{ .name = "order_id" },
         .{ .name = "amount" },
     };
-    var eng = try TransformEngine.initWithSchema(a, cfg, &cols);
+    var eng = try TransformEngine.initWithSchema(a, cfg, &cols, null);
     defer eng.deinit();
     try std.testing.expectEqual(@as(usize, 2), eng.mapper.mappings.len);
     try std.testing.expectEqualStrings("order_id", eng.mapper.mappings[0].source);
@@ -349,8 +413,93 @@ test "TransformEngine.initWithSchema merges user overrides" {
         .{ .name = "order_id" },
         .{ .name = "amount" },
     };
-    var eng = try TransformEngine.initWithSchema(a, cfg, &cols);
+    var eng = try TransformEngine.initWithSchema(a, cfg, &cols, null);
     defer eng.deinit();
     try std.testing.expectEqual(@as(usize, 2), eng.mapper.mappings.len);
     try std.testing.expectEqualStrings("id", eng.mapper.mappings[0].target);
+}
+
+test "TransformEngine.initWithSchema applies naming_rule camel_to_snake" {
+    const a = std.testing.allocator;
+    const cfg = TransformConfig{
+        .mall_id = "mall_camel",
+        .field_mappings_json = "",
+    };
+    const cols = [_]mapper_mod.ColumnMeta{
+        .{ .name = "orderId" },
+        .{ .name = "paidAt" },
+    };
+    var eng = try TransformEngine.initWithSchema(a, cfg, &cols, .camel_to_snake);
+    defer eng.deinit();
+    try std.testing.expectEqual(@as(usize, 2), eng.mapper.mappings.len);
+    try std.testing.expectEqualStrings("orderId", eng.mapper.mappings[0].source);
+    try std.testing.expectEqualStrings("order_id", eng.mapper.mappings[0].target);
+    try std.testing.expectEqualStrings("paid_at", eng.mapper.mappings[1].target);
+}
+
+test "parseNamingRule handles object form add_prefix" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"type":"add_prefix","value":"dt_"}
+    , .{});
+    defer parsed.deinit();
+
+    const rule = try parseNamingRule(parsed.value, a);
+    try std.testing.expect(rule != null);
+    switch (rule.?) {
+        .add_prefix => |p| try std.testing.expectEqualStrings("dt_", p),
+        else => return error.UnexpectedRule,
+    }
+}
+
+test "parseNamingRule handles plain string camel_to_snake" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\"camel_to_snake"
+    , .{});
+    defer parsed.deinit();
+
+    const rule = try parseNamingRule(parsed.value, a);
+    try std.testing.expect(rule != null);
+    switch (rule.?) {
+        .camel_to_snake => {},
+        else => return error.UnexpectedRule,
+    }
+}
+
+test "parseNamingRule returns null for unknown string" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\"mystery_rule"
+    , .{});
+    defer parsed.deinit();
+
+    const rule = try parseNamingRule(parsed.value, a);
+    try std.testing.expect(rule == null);
+}
+
+test "parseNamingRule handles object form strip_prefix" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"type":"strip_prefix","value":"dt_"}
+    , .{});
+    defer parsed.deinit();
+
+    const rule = try parseNamingRule(parsed.value, a);
+    try std.testing.expect(rule != null);
+    switch (rule.?) {
+        .strip_prefix => |p| try std.testing.expectEqualStrings("dt_", p),
+        else => return error.UnexpectedRule,
+    }
+}
+
+test "TransformConfig.deinit frees add_prefix slice without leak" {
+    // 用 std.testing.allocator 检测无泄漏: 通过 if 即视为未泄漏.
+    const a = std.testing.allocator;
+    var cfg = TransformConfig{
+        .mall_id = "mall_deinit",
+        .naming_rule = .{ .add_prefix = try a.dupe(u8, "pre_") },
+    };
+    cfg.deinit(a);
+    cfg.naming_rule = null; // deinit 后置 null, 防止之后误用
 }

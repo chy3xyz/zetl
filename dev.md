@@ -95,6 +95,25 @@ HTTP API:
 - `SyncTask.runFull` 启动时通过 `SHOW COLUMNS FROM <table>` 获取 source 列名, 自动使用 `initWithSchema`.
 - binlog 路径继续使用 parser 的现有列名 ("c0", "c1", ...); 真实列名映射留 Phase 6b (TABLE_MAP metadata).
 
+## Phase 6b: 列名重命名规则
+
+`Mapper` 支持基于 `NamingRule` 自动转换列名, 用户无需手工写 `field_mappings_json`.
+
+支持的规则:
+- `identity` (默认, 与 Phase 6 一致)
+- `camel_to_snake` (`orderId` → `order_id`)
+- `snake_to_camel` (`order_id` → `orderId`)
+- `upper` (`foo` → `FOO`)
+- `lower` (`FOO` → `foo`)
+- `add_prefix(prefix)` (`id` → `dt_id`)
+- `strip_prefix(prefix)` (`dt_id` → `id`)
+
+配置方式 (在 `config_json.transform.naming_rule`):
+- 字符串: `"naming_rule": "camel_to_snake"`
+- 对象: `"naming_rule": {"type": "add_prefix", "value": "dt_"}`
+
+用户 `field_mappings_json` 中的 override 仍优先于自动命名 (Phase 6 mergeOverrides 行为保留).
+
 ## Phase 7: sink 自动化
 
 `MySqlSink.ensureTargetTable` 自动通过 `CREATE TABLE IF NOT EXISTS` 创建 target_table, 用户添加新表同步时无需手工建表.
