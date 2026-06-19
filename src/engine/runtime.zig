@@ -6,6 +6,7 @@ const meta = @import("../meta/mod.zig");
 const cdc = @import("../cdc/mod.zig");
 const transform = @import("../transform/mod.zig");
 const sink_mod = @import("../sink/mod.zig");
+const mysql_sink = @import("../sink/mysql_sink.zig");
 const common = @import("../common/mod.zig");
 
 pub const RuntimeConfig = struct {
@@ -75,6 +76,10 @@ pub const SyncTask = struct {
 
     pub fn init(a: std.mem.Allocator, cfg: RuntimeConfig, ds: meta.datasource.Datasource, store: *meta.store.MetaStore, sp: *zfinal.ConnectionPool, src_pool: *zfinal.ConnectionPool, src_host: []u8, src_db: []u8, src_user: []u8, src_pass: []u8) !SyncTask {
         // TransformEngine / MySqlSink 会在内部复制需要的字符串, 这里直接传借用值.
+        // 提前初始化 sink — Phase 7 ensureTargetTable 需要 sk.pool / sk.target_table,
+        // 同时 fetched_cols 需要在 tr_init 块外存活以供 ensureTargetTable 消费.
+        const sk = sink_mod.mysql_sink.MySqlSink.init(a, sp, cfg.target_table, cfg.batch_size, "order_no");
+        var fetched_cols: ?[]transform.mapper.ColumnMeta = null;
         // 尝试从 source 表获取列元数据, 用于自动生成 identity 映射. 失败时退化为手工 init.
         const tr = tr_init: {
             const engine_cfg: transform.engine.TransformConfig = .{
@@ -91,17 +96,31 @@ pub const SyncTask = struct {
             tmp.src_pool = src_pool;
             tmp._sh = src_host;
             if (tmp.fetchSourceColumns()) |cols| {
-                defer {
-                    for (cols) |c| a.free(c.name);
-                    a.free(cols);
-                }
+                // cols 提升到 outer scope (fetched_cols), 由 init() 末尾统一释放,
+                // 以便 Phase 7 ensureTargetTable 在 initWithSchema 之后消费 cols.
+                fetched_cols = cols;
                 break :tr_init try transform.engine.TransformEngine.initWithSchema(a, engine_cfg, cols);
             } else |err| {
                 common.logger.warn("[task {d}] fetchSourceColumns 失败, 退化为手工映射: {s}", .{ cfg.task_id, @errorName(err) });
                 break :tr_init try transform.engine.TransformEngine.init(a, engine_cfg);
             }
         };
-        const sk = sink_mod.mysql_sink.MySqlSink.init(a, sp, cfg.target_table, cfg.batch_size, "order_no");
+        // Phase 7: 自动确保 target_table 存在 (DDL). 仅 fetchSourceColumns 成功时有 cols.
+        // 失败仅 warn, 假设表已存在 — 后续 sync 阶段若真缺失会立即报 SQL 错误, 不需要中断启动.
+        if (fetched_cols) |cols| {
+            defer {
+                for (cols) |c| a.free(c.name);
+                a.free(cols);
+            }
+            mysql_sink.MySqlSink.ensureTargetTable(
+                sk.pool,
+                sk.target_table,
+                cols,
+                .{},
+            ) catch |err| {
+                common.logger.warn("[task {d}] ensureTargetTable 失败: {s}, 继续 (假设已存在)", .{ cfg.task_id, @errorName(err) });
+            };
+        }
         const po = try meta.position.Service.load(store, a, cfg.task_id);
         const pl_cfg = cdc.poller.PollerConfig.fromSlices(src_host, ds.port, src_user, src_pass, src_db, cfg.source_table, cfg.pk_column, cfg.update_time_column, @intCast(cfg.batch_size));
         const pl = cdc.poller.Poller.init(a, pl_cfg, src_pool);
