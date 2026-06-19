@@ -114,8 +114,11 @@ pub const SyncTask = struct {
                 t.join();
                 self.thread = null;
             }
-            // runLoop 已退出但可能还没改 state — 主动置 success.
-            self.state.store(.success, .release);
+            // CAS: only transition if worker didn't already write a terminal state
+            // (e.g. .@"error" from a catch block). cmpxchgStrong(.running, .success, ...)
+            // silently no-ops if state has moved to success/err already.
+            const prev = self.state.cmpxchgStrong(.running, .success, .acq_rel, .acquire);
+            _ = prev; // return value intentionally ignored
         }
 
         self.transformer.deinit();
