@@ -23,6 +23,9 @@ pub const RuntimeConfig = struct {
     full_sync_sleep_ms: u64 = 50,
     incremental_poll_ms: u64 = 1000,
     mall_id: []const u8 = "",
+    /// Phase 6b: 列名重命名规则. null = identity (与 Phase 6 行为一致).
+    /// add_prefix / strip_prefix 的 prefix slice 由 caller 拥有, 需在 SyncTask.deinit 释放.
+    naming_rule: ?transform.mapper.NamingRule = null,
 };
 
 /// binlog 启动位点 (file + pos). pos 为 i64 与 SyncPosition.binlog_pos 对齐;
@@ -87,6 +90,8 @@ pub const SyncTask = struct {
                 .source_type = "mysql",
                 .field_mappings_json = cfg.field_mappings_json,
                 .enable_commission_calc = cfg.enable_commission_calc,
+                // Phase 6b: naming_rule 由 Task 4 通过 cfg.naming_rule 注入, 此处暂传 null.
+                .naming_rule = cfg.naming_rule,
             };
             // 临时 self 仅含 fetchSourceColumns 所需字段 (allocator, src_pool, _sh, cfg).
             // SyncTask 尚未构造, 用 undefined 占位未访问字段, 仅设置本次调用会读的字段.
@@ -99,7 +104,7 @@ pub const SyncTask = struct {
                 // cols 提升到 outer scope (fetched_cols), 由 init() 末尾统一释放,
                 // 以便 Phase 7 ensureTargetTable 在 initWithSchema 之后消费 cols.
                 fetched_cols = cols;
-                break :tr_init try transform.engine.TransformEngine.initWithSchema(a, engine_cfg, cols);
+                break :tr_init try transform.engine.TransformEngine.initWithSchema(a, engine_cfg, cols, cfg.naming_rule);
             } else |err| {
                 common.logger.warn("[task {d}] fetchSourceColumns 失败, 退化为手工映射: {s}", .{ cfg.task_id, @errorName(err) });
                 break :tr_init try transform.engine.TransformEngine.init(a, engine_cfg);
