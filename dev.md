@@ -114,6 +114,21 @@ HTTP API:
 
 用户 `field_mappings_json` 中的 override 仍优先于自动命名 (Phase 6 mergeOverrides 行为保留).
 
+## Phase 6c: 正则替换 + 链式规则
+
+`NamingRule` 新增 `regex_replace` 变体 + `applyNamingPipeline` 串联多个规则.
+
+支持的规则:
+- `regex_replace(pattern, replacement)` (`order_tmp` -> 用 `{"pattern":"_tmp$","replacement":""}` -> `order`)
+- 链式规则: `NamingRule` 数组, 顺序应用, e.g. `[camel_to_snake, add_prefix("dt_")]` 把 `orderId` -> `order_id` -> `dt_order_id`
+
+配置方式 (在 `config_json.transform.naming_rules`):
+- 数组形式: `"naming_rules": [{"type":"camel_to_snake"}, {"type":"add_prefix","value":"dt_"}]`
+- 单规则字符串: `"naming_rule": "camel_to_snake"` (向后兼容 Phase 6b)
+- 单规则对象: `"naming_rules": {"type":"add_prefix","value":"dt_"}` (自动 wrap 成 1-element array)
+
+regex_replace 支持 backref (`$1`, `$2` 等).
+
 ## Phase 7: sink 自动化
 
 `MySqlSink.ensureTargetTable` 自动通过 `CREATE TABLE IF NOT EXISTS` 创建 target_table, 用户添加新表同步时无需手工建表.
