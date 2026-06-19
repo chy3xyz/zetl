@@ -71,7 +71,7 @@ done
 
 ## 性能建议
 
-- 30 套 PolarDB 都在同一地域: zetl 单机 (4 核 8G) 可承载, 见 [PRD §5.1](../../docs/zetl_prd.md) (单进程 ≥ 100 链路).
+- 30 套 PolarDB 都在同一地域: zetl 单机 (4 核 8G) 可承载, 见 [PRD §5.1](../../../docs/zetl_prd.md) (单进程 ≥ 100 链路).
 - `sink.batch_size = 200` 在 PolarDB 写入场景是经验值, 大促可降到 50.
 
 ## 验证

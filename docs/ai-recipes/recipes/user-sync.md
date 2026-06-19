@@ -78,7 +78,7 @@ Phase 9 落地后, `config_json` 简化成:
 }
 ```
 
-届时本文档会更新. 详见 [dev.md](../../dev.md) Phase 9.
+届时本文档会更新. 详见 [dev.md](../../../dev.md) Phase 9.
 
 ## 验证步骤
 

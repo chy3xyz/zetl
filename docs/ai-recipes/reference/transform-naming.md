@@ -16,11 +16,13 @@
 ## 链式规则 (`naming_rules`, Phase 6c)
 
 ```json
-"naming_rules": [
-  {"type": "camel_to_snake"},
-  {"type": "regex_replace", "pattern": "_tmp$", "replacement": ""},
-  {"type": "add_prefix", "value": "dt_"}
-]
+{
+  "naming_rules": [
+    {"type": "camel_to_snake"},
+    {"type": "regex_replace", "pattern": "_tmp$", "replacement": ""},
+    {"type": "add_prefix", "value": "dt_"}
+  ]
+}
 ```
 
 `orderId` → `order_id` → `order` → `dt_order`.

@@ -97,7 +97,7 @@ CREATE TABLE union_all_order (
 
 ### 想加 update_time 过滤 (只同步已支付订单)
 
-等 Phase 9 `transform.filter` 落地 (见 [dev.md](../../dev.md) Phase 9).
+等 Phase 9 `transform.filter` 落地 (见 [dev.md](../../../dev.md) Phase 9).
 
 ### 想从 30 套 PolarDB 一起同步
 

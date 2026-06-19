@@ -20,27 +20,16 @@
 
 ## 6 个常用例子
 
-```json
-// 1. 重命名
-[{"source": "phone", "target": "user_phone"}]
-
-// 2. 默认值填充
-[{"source": "remark", "target": "remark", "default": ""}]
-
-// 3. 类型转换
-[{"source": "is_vip", "target": "is_vip", "type": "bool"}]
-
-// 4. 跳过列 (不写就不会同步)
-[]
-
-// 5. 多个 override
-[{"source": "a", "target": "a"}, {"source": "b", "target": "B"}]
-
-// 6. 配合 naming_rule (override 优先)
-[
-  {"source": "id", "target": "mall_id"},
-  {"source": "mallId", "target": "real_mall_id"}
-]
+```text
+1. 重命名: [{"source":"phone","target":"user_phone"}]
+2. 默认值填充: [{"source":"remark","target":"remark","default":""}]
+3. 类型转换: [{"source":"is_vip","target":"is_vip","type":"bool"}]
+4. 跳过列 (不写就不会同步): []
+5. 多个 override: [{"source":"a","target":"a"},{"source":"b","target":"B"}]
+6. 配合 naming_rule (override 优先): [
+     {"source":"id","target":"mall_id"},
+     {"source":"mallId","target":"real_mall_id"}
+   ]
 ```
 
 ## 与 `naming_rule` 关系
