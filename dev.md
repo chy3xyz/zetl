@@ -105,3 +105,18 @@ HTTP API:
 - 默认 charset utf8mb4 + engine InnoDB; target_db 可选.
 - binlog / poll 路径自动复用 Phase 6 的 source schema.
 - 已知限制: VARCHAR / CHAR 长度、DECIMAL precision/scale 用默认值; 后续 Phase 7b 支持从 source metadata 推断.
+
+## Phase 8: 鉴权覆盖 (Auth coverage)
+
+Phase 5 引入的 `/api/tasks/*` 端点此前**绕过鉴权中间件** (注释 "暂不鉴权"). Phase 8 修复这个安全漏洞: 给 6 个端点加 `authInterceptor` + `permissionInterceptor`, 与 V1 `/api/v1/task/*` 对齐.
+
+- `/api/tasks` (GET)         需要 `task:read`
+- `/api/tasks` (POST)        需要 `task:write`
+- `/api/tasks/:id` (GET)     需要 `task:read`
+- `/api/tasks/:id` (PUT)     需要 `task:write`
+- `/api/tasks/:id` (DELETE)  需要 `task:delete`
+- `/api/tasks/:id/reload` (POST) 需要 `task:start`
+
+无 token → 401; 携带 viewer token 但缺少权限 → 403; admin/operator token → 200/201.
+
+新增单元测试覆盖 `isPublicPath` 的公开/私有路径判定.

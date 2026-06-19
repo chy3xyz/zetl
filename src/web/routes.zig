@@ -86,13 +86,18 @@ pub fn registerAll(
     try app.postWithInterceptors("/api/v1/task/:id/stop", task.stop, &task_stop_intc);
     try app.deleteWithInterceptors("/api/v1/task/:id", task.delete, &task_delete_intc);
 
-    // V5 Phase 5 Task 5: 动态任务管理 /api/tasks (DB + Scheduler 联动, 暂不鉴权)
-    try app.get("/api/tasks", tasks_api.list);
-    try app.post("/api/tasks", tasks_api.create);
-    try app.get("/api/tasks/:id", tasks_api.detail);
-    try app.put("/api/tasks/:id", tasks_api.update);
-    try app.delete("/api/tasks/:id", tasks_api.delete);
-    try app.post("/api/tasks/:id/reload", tasks_api.reload);
+    // V5 Phase 5 Task 5: 动态任务管理 /api/tasks (DB + Scheduler 联动)
+    // P1 任务 2: 全量加 auth + RBAC, 与 V1 /api/v1/task 对齐权限模型
+    const v5_task_read_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("task:read") };
+    const v5_task_write_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("task:write") };
+    const v5_task_delete_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("task:delete") };
+    const v5_task_start_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("task:start") };
+    try app.getWithInterceptors("/api/tasks", tasks_api.list, &v5_task_read_intc);
+    try app.postWithInterceptors("/api/tasks", tasks_api.create, &v5_task_write_intc);
+    try app.getWithInterceptors("/api/tasks/:id", tasks_api.detail, &v5_task_read_intc);
+    try app.putWithInterceptors("/api/tasks/:id", tasks_api.update, &v5_task_write_intc);
+    try app.deleteWithInterceptors("/api/tasks/:id", tasks_api.delete, &v5_task_delete_intc);
+    try app.postWithInterceptors("/api/tasks/:id/reload", tasks_api.reload, &v5_task_start_intc);
 
     // 监控
     const monitor_read_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("monitor:read") };
