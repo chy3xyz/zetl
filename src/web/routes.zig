@@ -12,6 +12,7 @@ const auth = @import("handler/auth.zig");
 const datasource = @import("handler/datasource.zig");
 const task = @import("handler/task.zig");
 const monitor = @import("handler/monitor.zig");
+const tasks_api = @import("api/tasks.zig");
 
 /// 注册所有路由. 启动时调用一次.
 pub fn registerAll(
@@ -84,6 +85,14 @@ pub fn registerAll(
     try app.postWithInterceptors("/api/v1/task/:id/start", task.start, &task_start_intc);
     try app.postWithInterceptors("/api/v1/task/:id/stop", task.stop, &task_stop_intc);
     try app.deleteWithInterceptors("/api/v1/task/:id", task.delete, &task_delete_intc);
+
+    // V5 Phase 5 Task 5: 动态任务管理 /api/tasks (DB + Scheduler 联动, 暂不鉴权)
+    try app.get("/api/tasks", tasks_api.list);
+    try app.post("/api/tasks", tasks_api.create);
+    try app.get("/api/tasks/:id", tasks_api.detail);
+    try app.put("/api/tasks/:id", tasks_api.update);
+    try app.delete("/api/tasks/:id", tasks_api.delete);
+    try app.post("/api/tasks/:id/reload", tasks_api.reload);
 
     // 监控
     const monitor_read_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("monitor:read") };

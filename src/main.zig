@@ -57,9 +57,14 @@ pub fn main(init: std.process.Init) !void {
     scheduler.* = engine.scheduler.Scheduler.init(allocator, &store, sink_pool);
     global_scheduler = scheduler;
 
-    // 7. 启动时加载所有 status=1 任务
+    // 7. 启动时加载所有 status=1 任务 (V1/V2 sync_task 表, 旧路径)
     scheduler.bootstrapAll() catch |err| {
         common.logger.err_("启动任务失败: {s}", .{@errorName(err)});
+    };
+
+    // 7b. V5 Phase 5: 从 tasks_config 表加载所有 active 任务 (新路径, 动态任务)
+    scheduler.loadFromDb() catch |err| {
+        common.logger.warn("loadFromDb 失败: {s}", .{@errorName(err)});
     };
 
     // 8. 启动 Web 控制台
@@ -100,6 +105,8 @@ test {
     _ = @import("common/alarm.zig");
     _ = @import("meta/datasource.zig");
     _ = @import("meta/task.zig");
+    _ = @import("meta/task/config.zig");
+    _ = @import("meta/task/service.zig");
     _ = @import("meta/position.zig");
     _ = @import("meta/store.zig");
     _ = @import("cdc/poller.zig");

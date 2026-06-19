@@ -60,3 +60,19 @@
 - **伪 CDC → 真 CDC**: V1/V2 基于 `update_time` 轮询; V3 新增真 binlog CDC (`sync_mode=binlog/both`), 可感知物理删除. 已落地为 phase 1, 详见 docs/superpowers/specs/2026-06-16-zetl-v3-binlog-cdc-design.md.
 - **V3 binlog parser phase 3**: 已支持 DATETIME / DATETIME2 / NEWDECIMAL / BLOB / TEXT / JSON / VARCHAR (≤255 已支持, 新增 >255 双字节长度) / DATE / YEAR / TIME / TIME2 / TIMESTAMP / TIMESTAMP2 / FLOAT / DOUBLE 解码. 不支持 BIT / ENUM / SET / GEOMETRY, 这些列返回 `error.UnsupportedType`. 已支持自动剥离 4 字节 CRC32 校验和 (`binlog_checksum=NONE` 不再是必须). SHOW MASTER STATUS 在 MySQL 8.0.22+ 改为 SHOW BINARY LOG STATUS.
 - **优雅停机**: ✅ zfinal v0.10.8 已修复; SIGTERM/SIGINT 可在 ~3s 内完成停机, 无 panic, 无泄漏.
+
+## 动态任务管理 (Phase 5)
+
+任务定义存储在 `tasks_config` 表中 (DDL 在 `src/meta/store.zig::createAllTables()`).
+
+HTTP API:
+- `GET /api/tasks`           列出所有任务
+- `POST /api/tasks`          创建任务 (body = TaskConfig JSON)
+- `GET /api/tasks/{id}`      查看单个任务
+- `PUT /api/tasks/{id}`      更新任务 (active 时自动 reload)
+- `DELETE /api/tasks/{id}`   删除任务 (active 时先 stop)
+- `POST /api/tasks/{id}/reload`  强制重载
+
+启动时 `Scheduler.loadFromDb()` 自动加载所有 `status=active` 任务.
+
+详见 `docs/superpowers/specs/2026-06-15-zetl-config-dynamic-tasks-design.md`.
