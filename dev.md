@@ -84,3 +84,13 @@ HTTP API:
 启动时 `Scheduler.loadFromDb()` 自动加载所有 `status=active` 任务.
 
 详见 `docs/superpowers/specs/2026-06-15-zetl-config-dynamic-tasks-design.md`.
+
+## Phase 6: transform 自动化
+
+`Mapper` 支持基于 source schema 自动生成默认列映射 (identity), 用户可在 `field_mappings_json` 中覆盖特定列的 target / default / type.
+
+- `Mapper.fromSchema(allocator, []ColumnMeta)`: 从 source 列元数据生成 N 个 identity mappings.
+- `Mapper.mergeOverrides(allocator, user_json)`: 应用用户 override, 命中 source 的项替换 target/default/type, 未命中的额外 mapping 追加.
+- `TransformEngine.initWithSchema(...)`: 新入口, 调 fromSchema 后 mergeOverrides.
+- `SyncTask.runFull` 启动时通过 `SHOW COLUMNS FROM <table>` 获取 source 列名, 自动使用 `initWithSchema`.
+- binlog 路径继续使用 parser 的现有列名 ("c0", "c1", ...); 真实列名映射留 Phase 6b (TABLE_MAP metadata).
