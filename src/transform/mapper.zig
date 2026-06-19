@@ -19,6 +19,11 @@ pub const ColumnMeta = struct {
     type: u8 = 0,
 };
 
+pub const RegexReplace = struct {
+    pattern: []const u8,
+    replacement: []const u8,
+};
+
 pub const NamingRule = union(enum) {
     identity,
     camel_to_snake,
@@ -27,6 +32,7 @@ pub const NamingRule = union(enum) {
     lower,
     add_prefix: []const u8,
     strip_prefix: []const u8,
+    regex_replace: RegexReplace,
 };
 
 pub fn applyNamingRule(rule: NamingRule, source: []const u8, allocator: std.mem.Allocator) ![]const u8 {
@@ -38,7 +44,262 @@ pub fn applyNamingRule(rule: NamingRule, source: []const u8, allocator: std.mem.
         .lower => lowerStr(allocator, source),
         .add_prefix => |prefix| std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, source }),
         .strip_prefix => |prefix| stripPrefix(allocator, prefix, source),
+        .regex_replace => |rr| regexReplace(allocator, source, rr),
     };
+}
+
+pub fn applyNamingPipeline(rules: []const NamingRule, source: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+    var current: []const u8 = try allocator.dupe(u8, source);
+    errdefer allocator.free(current);
+    for (rules) |rule| {
+        const next = try applyNamingRule(rule, current, allocator);
+        allocator.free(current);
+        current = next;
+    }
+    return current;
+}
+
+// Minimal regex engine for NamingRule.regex_replace. Supports:
+//   ^ $ ( ) \w + ? * . | literal
+//   $1 $2 ... backref in replacement.
+// Not a general regex engine — covers the patterns used in naming-rule configs.
+const RegexAtom = union(enum) {
+    literal: u8,
+    word: void,
+    any: void,
+};
+
+const CapsBuf = struct {
+    buf: [16]struct { start: usize, end: usize } = undefined,
+    count: usize = 0,
+};
+
+fn charMatches(atom: RegexAtom, ch: u8) bool {
+    return switch (atom) {
+        .literal => |lit| ch == lit,
+        .word => std.ascii.isAlphanumeric(ch) or ch == '_',
+        .any => true,
+    };
+}
+
+/// Try to match `pattern[p..]` against `text[t..]`. Returns the new t on success, null otherwise.
+/// `caps` is populated with capture group (start, end) indices into `text`.
+/// `max_end`: if non-null, the match is bounded at most at this absolute t (used for group enumeration).
+fn regexMatchHere(
+    pattern: []const u8,
+    p: usize,
+    text: []const u8,
+    t: usize,
+    caps: *CapsBuf,
+    max_end: ?usize,
+) !?usize {
+    var pp = p;
+    var tt = t;
+    while (pp < pattern.len) {
+        const c = pattern[pp];
+        if (c == '$' and pp + 1 == pattern.len) {
+            return if (tt == text.len) tt else null;
+        }
+        if (c == '^' and pp == 0) {
+            if (tt != 0) return null;
+            pp += 1;
+            continue;
+        }
+        if (c == '(') {
+            var depth: usize = 1;
+            var end = pp + 1;
+            while (end < pattern.len) {
+                if (pattern[end] == '\\' and end + 1 < pattern.len) {
+                    end += 2;
+                    continue;
+                }
+                if (pattern[end] == '(') {
+                    depth += 1;
+                    end += 1;
+                } else if (pattern[end] == ')') {
+                    depth -= 1;
+                    if (depth == 0) break;
+                    end += 1;
+                } else {
+                    end += 1;
+                }
+            }
+            if (depth != 0) return null;
+            const close_idx = end; // index of the closing `)`
+            const inner = pattern[pp + 1 .. close_idx];
+
+            const cap_idx = caps.count;
+            caps.buf[cap_idx] = .{ .start = tt, .end = tt };
+            caps.count += 1;
+
+            // Greedy end of inner (no constraint) to know the upper bound for enumeration.
+            if (try regexMatchHere(inner, 0, text, tt, caps, null)) |greedy_end| {
+                var try_end: usize = greedy_end;
+                while (true) {
+                    caps.count = cap_idx + 1;
+                    caps.buf[cap_idx] = .{ .start = tt, .end = tt };
+                    if (try regexMatchHere(inner, 0, text, tt, caps, try_end)) |inner_end| {
+                        if (inner_end == try_end) {
+                            caps.buf[cap_idx].end = inner_end;
+                            if (try regexMatchHere(pattern, close_idx + 1, text, inner_end, caps, null)) |final_t| {
+                                return final_t;
+                            }
+                        }
+                    }
+                    if (try_end == tt) break;
+                    try_end -= 1;
+                }
+            }
+            caps.count -= 1;
+            return null;
+        }
+        var atom: RegexAtom = undefined;
+        var atom_size: usize = 1;
+        if (c == '\\' and pp + 1 < pattern.len and pattern[pp + 1] == 'w') {
+            atom = .word;
+            atom_size = 2;
+        } else if (c == '.') {
+            atom = .any;
+        } else {
+            atom = .{ .literal = c };
+        }
+        var min_q: usize = 1;
+        var max_q: usize = 1;
+        if (pp + atom_size < pattern.len) {
+            const q = pattern[pp + atom_size];
+            if (q == '*') {
+                min_q = 0;
+                max_q = std.math.maxInt(usize);
+                pp += atom_size + 1;
+            } else if (q == '+') {
+                min_q = 1;
+                max_q = std.math.maxInt(usize);
+                pp += atom_size + 1;
+            } else if (q == '?') {
+                min_q = 0;
+                max_q = 1;
+                pp += atom_size + 1;
+            } else {
+                pp += atom_size;
+            }
+        } else {
+            pp += atom_size;
+        }
+        // Greedy match (respecting max_end)
+        var matched: usize = 0;
+        while (matched < max_q and tt < text.len) {
+            if (max_end) |me| {
+                if (tt >= me) break;
+            }
+            if (!charMatches(atom, text[tt])) break;
+            tt += 1;
+            matched += 1;
+        }
+        if (matched < min_q) return null;
+        // Backtrack: try matching the rest with fewer (or zero) repetitions
+        var try_t = tt;
+        while (true) {
+            if (try regexMatchHere(pattern, pp, text, try_t, caps, max_end)) |final_t| {
+                tt = final_t;
+                return tt;
+            }
+            if (matched == 0) return null;
+            matched -= 1;
+            try_t -= 1;
+        }
+    }
+    return tt;
+}
+
+/// Find the first match in `text`. Returns match (start, end) on success.
+/// Honors `^` (anchored start) and `$` (anchored end).
+fn regexFindMatch(pattern: []const u8, text: []const u8, caps: *CapsBuf) !?struct { start: usize, end: usize } {
+    var p: usize = 0;
+    var anchored_start = false;
+    if (pattern.len > 0 and pattern[0] == '^') {
+        anchored_start = true;
+        p = 1;
+    }
+    var anchored_end = false;
+    if (pattern.len > 0 and pattern[pattern.len - 1] == '$') {
+        anchored_end = true;
+    }
+    if (anchored_start) {
+        if (try regexMatchHere(pattern, p, text, 0, caps, null)) |end_t| {
+            if (anchored_end and end_t != text.len) return null;
+            return .{ .start = 0, .end = end_t };
+        }
+        return null;
+    }
+    var t_start: usize = 0;
+    while (t_start <= text.len) {
+        if (try regexMatchHere(pattern, p, text, t_start, caps, null)) |end_t| {
+            if (anchored_end and end_t != text.len) {
+                t_start += 1;
+                continue;
+            }
+            return .{ .start = t_start, .end = end_t };
+        }
+        t_start += 1;
+    }
+    return null;
+}
+
+fn regexReplace(allocator: std.mem.Allocator, source: []const u8, rr: RegexReplace) ![]const u8 {
+    var caps: CapsBuf = .{};
+    const maybe_match = try regexFindMatch(rr.pattern, source, &caps);
+    if (maybe_match == null) return allocator.dupe(u8, source);
+    const m = maybe_match.?;
+    const prefix = source[0..m.start];
+    const suffix = source[m.end..];
+
+    // Compute replacement length (with backref expansion)
+    var repl_len: usize = 0;
+    var r: usize = 0;
+    while (r < rr.replacement.len) {
+        if (rr.replacement[r] == '$' and r + 1 < rr.replacement.len and rr.replacement[r + 1] >= '1' and rr.replacement[r + 1] <= '9') {
+            r += 1;
+            const n: usize = @intCast(rr.replacement[r] - '1'); // '1' → caps[0], '2' → caps[1], ...
+            if (n < caps.count) {
+                repl_len += caps.buf[n].end - caps.buf[n].start;
+            }
+            r += 1;
+        } else {
+            repl_len += 1;
+            r += 1;
+        }
+    }
+
+    const out = try allocator.alloc(u8, prefix.len + repl_len + suffix.len);
+    var o: usize = 0;
+    if (prefix.len > 0) {
+        @memcpy(out[o..][0..prefix.len], prefix);
+        o += prefix.len;
+    }
+    r = 0;
+    while (r < rr.replacement.len) {
+        if (rr.replacement[r] == '$' and r + 1 < rr.replacement.len and rr.replacement[r + 1] >= '1' and rr.replacement[r + 1] <= '9') {
+            r += 1;
+            const n: usize = @intCast(rr.replacement[r] - '1');
+            if (n < caps.count) {
+                const cap = caps.buf[n];
+                const slice = source[cap.start..cap.end];
+                if (slice.len > 0) {
+                    @memcpy(out[o..][0..slice.len], slice);
+                    o += slice.len;
+                }
+            }
+            r += 1;
+        } else {
+            out[o] = rr.replacement[r];
+            o += 1;
+            r += 1;
+        }
+    }
+    if (suffix.len > 0) {
+        @memcpy(out[o..][0..suffix.len], suffix);
+    }
+    return out;
 }
 
 fn upperStr(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
@@ -501,4 +762,44 @@ test "applyNamingRule strip_prefix returns original if no match" {
     const out = try applyNamingRule(.{ .strip_prefix = "dt_" }, "id", a);
     defer a.free(out);
     try std.testing.expectEqualStrings("id", out);
+}
+
+test "applyNamingRule regex_replace strips _tmp suffix" {
+    const a = std.testing.allocator;
+    const rule: NamingRule = .{ .regex_replace = .{
+        .pattern = "_tmp$",
+        .replacement = "",
+    } };
+    const out = try applyNamingRule(rule, "order_tmp", a);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("order", out);
+}
+
+test "applyNamingRule regex_replace supports backref" {
+    const a = std.testing.allocator;
+    const rule: NamingRule = .{ .regex_replace = .{
+        .pattern = "^(\\w+)_id$",
+        .replacement = "$1_identifier",
+    } };
+    const out = try applyNamingRule(rule, "order_id", a);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("order_identifier", out);
+}
+
+test "applyNamingPipeline chains camel_to_snake then add_prefix" {
+    const a = std.testing.allocator;
+    const rules = [_]NamingRule{
+        .camel_to_snake,
+        .{ .add_prefix = "dt_" },
+    };
+    const out = try applyNamingPipeline(&rules, "orderId", a);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("dt_order_id", out);
+}
+
+test "applyNamingPipeline empty rules returns source copy" {
+    const a = std.testing.allocator;
+    const out = try applyNamingPipeline(&.{}, "orderId", a);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("orderId", out);
 }
