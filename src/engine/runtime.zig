@@ -119,17 +119,34 @@ pub const SyncTask = struct {
     }
 
     pub fn start(self: *SyncTask) !void {
-        if (self.is_running.load(.acquire)) return;
-        self.is_running.store(true, .release);
+        // 允许从 pending / success / @"error" 重新启动; 若 state == .running 则返回 error.AlreadyRunning.
+        // cmpxchgStrong 在 Zig 中返回 ?T (成功 = 旧值, 失败 = null), 所以用 load + CAS 重试模式.
+        while (true) {
+            const current = self.state.load(.acquire);
+            switch (current) {
+                .running => return error.AlreadyRunning,
+                .pending, .success, .@"error" => {
+                    if (self.state.cmpxchgStrong(current, .running, .acq_rel, .acquire) != null) break;
+                    // CAS 失败: 状态被并发改动, 重试.
+                },
+            }
+        }
+        self.should_stop.store(false, .release);
+        self.is_finished.store(false, .release);
+        if (self.last_error) |old| {
+            self.allocator.free(old);
+            self.last_error = null;
+        }
         self.thread = try std.Thread.spawn(.{}, runLoop, .{self});
     }
 
     pub fn stop(self: *SyncTask) void {
-        self.is_running.store(false, .release);
+        self.should_stop.store(true, .release);
         if (self.thread) |t| {
             t.join();
             self.thread = null;
         }
+        // 不修改 state — runLoop 退出时根据自身结果置 success/err.
     }
 
     fn runLoop(self: *SyncTask) void {
@@ -137,6 +154,11 @@ pub const SyncTask = struct {
         defer {
             common.logger.inf("[task {d}] 退出", .{self.cfg.task_id});
             self.is_finished.store(true, .release);
+            // 主路径 (runLoop 自身正常返回, 未被 stop 干预且 catch 块未 markError)
+            // → success. 错误路径已经在 catch 块 markError.
+            if (self.state.load(.acquire) == .running) {
+                self.markSuccess();
+            }
         }
 
         // 启动时 / 全量后尝试加载佣金规则; enable_commission_calc 为 true 才需要.
@@ -155,7 +177,7 @@ pub const SyncTask = struct {
         }
 
         // 2. 增量阶段 (按 sync_mode 分发)
-        if (!self.is_running.load(.acquire)) return;
+        if (self.should_stop.load(.acquire)) return;
 
         // 增量阶段
         switch (self.cfg.sync_mode) {
@@ -183,7 +205,7 @@ pub const SyncTask = struct {
         common.logger.inf("[task {d}] 全量 pk='{s}'", .{ self.cfg.task_id, self.pos.last_pk });
         var last = try self.allocator.dupe(u8, if (self.pos.last_pk.len > 0) self.pos.last_pk else "0");
         defer self.allocator.free(last);
-        while (self.is_running.load(.acquire)) {
+        while (!self.should_stop.load(.acquire)) {
             const rows = try self.poller.fetchFullBatch(last);
             if (rows.len == 0) {
                 common.logger.inf("[task {d}] 全量完成", .{self.cfg.task_id});
@@ -214,7 +236,7 @@ pub const SyncTask = struct {
         defer self.allocator.free(last_ut);
         var last_pk = try self.allocator.dupe(u8, if (self.pos.last_pk.len > 0) self.pos.last_pk else "0");
         defer self.allocator.free(last_pk);
-        while (self.is_running.load(.acquire)) {
+        while (!self.should_stop.load(.acquire)) {
             const rows = try self.poller.fetchIncrementalBatch(last_ut, last_pk);
             if (rows.len > 0) {
                 const next_ut = try self.allocator.dupe(u8, rows[rows.len - 1].fields.get(self.cfg.update_time_column) orelse "");
@@ -264,7 +286,7 @@ pub const SyncTask = struct {
         var parser = cdc.binlog.parser.Parser.init(self.allocator);
         defer parser.deinit();
 
-        while (self.is_running.load(.acquire)) {
+        while (!self.should_stop.load(.acquire)) {
             const raw = reader.nextEvent() catch |err| {
                 common.logger.err_("[task {d}] binlog fetch: {s}", .{ self.cfg.task_id, @errorName(err) });
                 sleepMs(1000);
@@ -423,8 +445,12 @@ pub const SyncTask = struct {
         self.loadRules();
     }
 
+    fn markSuccess(self: *SyncTask) void {
+        self.state.store(.success, .release);
+    }
+
     fn markError(self: *SyncTask, msg: []const u8) void {
-        self.status = 2;
+        self.state.store(.@"error", .release);
         if (self.last_error) |e| self.allocator.free(e);
         self.last_error = self.allocator.dupe(u8, msg) catch null;
         meta.task.Service.updateStatus(self.store, self.cfg.task_id, 2, msg) catch {};

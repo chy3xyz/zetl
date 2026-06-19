@@ -16,7 +16,7 @@ pub const Scheduler = struct {
     mutex: std.Io.Mutex = .init,
     /// P1 任务 1.8: 优雅停机标志. 置位后:
     ///   - startTask 立即返回 error.ShutdownInProgress
-    ///   - 所有运行中 task 的 is_running 会被强制置为 false
+    ///   - 所有运行中 task 的 should_stop 会被强制置为 true
     ///   - 调用方应等待 batch 跑完后再 deinit
     is_shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// V5 Phase 5: 测试模式. true 时 addTask/removeTask 走 stub 路径,
@@ -688,7 +688,7 @@ pub const Scheduler = struct {
     ///
     /// 行为:
     ///   1. 立即设置 is_shutting_down = true (后续 startTask 立即返回 error.ShutdownInProgress)
-    ///   2. 遍历 self.tasks, 把每个 task 的 is_running 置为 false (worker 线程会在下个 batch 边界退出循环)
+    ///   2. 遍历 self.tasks, 把每个 task 的 should_stop 置为 true (worker 线程会在下个 batch 边界退出循环)
     ///   3. 软等待 timeout_ms 毫秒, 给在跑的 batch 一个自然 commit 的窗口
     ///   4. 不做 thread.join (deinit 会做). 任何卡在 MySQL 查询里的线程, 会在 deinit 阶段被 join 阻塞
     ///      — 这是已知的设计折衷, 进程二次信号仍可强制退出.
@@ -709,7 +709,7 @@ pub const Scheduler = struct {
         var it = self.tasks.iterator();
         while (it.next()) |entry| {
             const task = entry.value_ptr.*;
-            task.is_running.store(false, .release);
+            task.should_stop.store(true, .release);
             count += 1;
         }
         self.mutex.unlock(io);
