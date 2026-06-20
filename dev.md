@@ -154,6 +154,11 @@ regex_replace 支持 backref (`$1`, `$2` 等).
 
 无代码变更. 仅 markdown.
 
+## Phase 9b: 完善
+
+- 修复 Phase 6c 留下的 2 个测试内存泄漏 (`parseNamingRule handles object form add_prefix/strip_prefix`): 加 `defer freeRule(a, rule)`, `zig build test` 从 "2 leaked" → "0 leaked".
+- README.md 新增"面向 AI 业务场景搭建"section, 链接到 `docs/ai-recipes/` 决策树, 让新用户能发现 AI 速搭文档.
+
 ## Phase 8: 鉴权覆盖 (Auth coverage)
 
 Phase 5 引入的 `/api/tasks/*` 端点此前**绕过鉴权中间件** (注释 "暂不鉴权"). Phase 8 修复这个安全漏洞: 给 6 个端点加 `authInterceptor` + `permissionInterceptor`, 与 V1 `/api/v1/task/*` 对齐.
