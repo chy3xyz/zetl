@@ -108,6 +108,11 @@ pub const TransformConfig = struct {
             }
         }
 
+        // mask_phone (Phase 10)
+        if (transform.get("mask_phone")) |mp| {
+            if (mp == .bool) cfg.mask_phone = mp.bool;
+        }
+
         return cfg;
     }
 };
@@ -723,6 +728,30 @@ test "TransformConfig parses regex_replace naming_rule from json" {
         },
         else => return error.UnexpectedRule,
     }
+}
+
+test "TransformConfig parses transform.mask_phone from json" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"transform":{"mask_phone":true}}
+    , .{});
+    defer parsed.deinit();
+
+    const cfg = try TransformConfig.initFromJson(a, parsed.value);
+    defer cfg.deinit(a);
+    try std.testing.expect(cfg.mask_phone == true);
+}
+
+test "TransformConfig mask_phone defaults to false when absent" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"transform":{"naming_rule":"camel_to_snake"}}
+    , .{});
+    defer parsed.deinit();
+
+    const cfg = try TransformConfig.initFromJson(a, parsed.value);
+    defer cfg.deinit(a);
+    try std.testing.expect(cfg.mask_phone == false);
 }
 
 test "maskPhoneIfNeeded masks middle 4 digits" {
