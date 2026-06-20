@@ -50,6 +50,9 @@ pub const TransformConfig = struct {
     /// 由 cfg 拥有, 需要调用 deinit(allocator) 释放.
     naming_rules: []const mapper_mod.NamingRule = &.{},
 
+    /// Phase 10: 自动脱敏 phone / mobile / tel 字段中间 4 位. 默认 false.
+    mask_phone: bool = false,
+
     /// 释放 naming_rule 与 naming_rules 中所有堆拥有 slice.
     /// 其他变体 (identity / camel_to_snake / snake_to_camel / upper / lower)
     /// 无堆内存, 不需要 free.
@@ -305,6 +308,38 @@ pub const TransformEngine = struct {
         // 注: target 已包含 dupe'd key/value, mapper.apply 成功后所有权完整转移
         // 后续 errdefer 用 freeRowData 整体释放
 
+        // 1.5 Phase 10: 自动脱敏 phone-like 字段 (cfg.mask_phone 控制)
+        if (self.cfg.mask_phone) {
+            // 第一遍: 收集要脱敏的 key (避免在迭代时修改 HashMap)
+            var to_mask = std.ArrayList([]const u8).empty;
+            defer to_mask.deinit(self.allocator);
+            {
+                var it = target.iterator();
+                while (it.next()) |entry| {
+                    if (looksLikePhoneField(entry.key_ptr.*)) {
+                        try to_mask.append(self.allocator, try self.allocator.dupe(u8, entry.key_ptr.*));
+                    }
+                }
+            }
+            // 第二遍: 替换 value
+            for (to_mask.items) |key| {
+                defer self.allocator.free(key);
+                const removed = target.fetchRemove(key) orelse continue;
+                const masked = maskPhoneIfNeeded(self.allocator, key, removed.value, self.cfg) catch |err| {
+                    self.allocator.free(removed.key);
+                    self.allocator.free(removed.value);
+                    return err;
+                };
+                if (masked) |mv| {
+                    self.allocator.free(removed.value);
+                    try target.put(removed.key, mv);
+                } else {
+                    // 不满足脱敏条件 (非纯数字 / 太短), put 回原 value
+                    try target.put(removed.key, removed.value);
+                }
+            }
+        }
+
         // 2. 自动补齐目标表标准字段 (仅在尚未映射时)
         // create_time -> source_create_time, update_time -> source_update_time
         if (target.get("source_create_time") == null) {
@@ -394,6 +429,40 @@ pub const TransformEngine = struct {
         }
 
         return target;
+    }
+
+    /// 如果 cfg.mask_phone 为 true 且 field_name 包含 "phone" / "mobile" / "tel" 子串,
+    /// 且 value 是 ≥ 7 位数字, 把中间 4 位替换成 "****". 返回新值 (caller 负责 free).
+    /// 不满足条件返回 null (表示不修改).
+    fn maskPhoneIfNeeded(
+        allocator: std.mem.Allocator,
+        field_name: []const u8,
+        value: []const u8,
+        cfg: TransformConfig,
+    ) !?[]u8 {
+        if (!cfg.mask_phone) return null;
+        if (!looksLikePhoneField(field_name)) return null;
+        if (value.len < 7) return null;
+        if (!isAllDigits(value)) return null;
+
+        // 中间 4 位替换: "13800138000" -> "138****8000"
+        const prefix_len = (value.len - 4) / 2;
+        const suffix_start = prefix_len + 4;
+        return @as(?[]u8, try std.fmt.allocPrint(allocator, "{s}****{s}", .{ value[0..prefix_len], value[suffix_start..] }));
+    }
+
+    /// 判断 field name 是否看起来像手机号字段 (大小写敏感, "phone" / "mobile" / "tel" 子串).
+    fn looksLikePhoneField(name: []const u8) bool {
+        if (std.mem.indexOf(u8, name, "phone") != null) return true;
+        if (std.mem.indexOf(u8, name, "mobile") != null) return true;
+        if (std.mem.indexOf(u8, name, "tel") != null) return true;
+        return false;
+    }
+
+    /// 判断字符串是否全是 ASCII 数字.
+    fn isAllDigits(s: []const u8) bool {
+        for (s) |c| if (c < '0' or c > '9') return false;
+        return true;
     }
 
     /// 返回 true = 跳过 (filter 不通过)
@@ -654,4 +723,31 @@ test "TransformConfig parses regex_replace naming_rule from json" {
         },
         else => return error.UnexpectedRule,
     }
+}
+
+test "maskPhoneIfNeeded masks middle 4 digits" {
+    const a = std.testing.allocator;
+    const cfg: TransformConfig = .{ .mall_id = "m", .source_type = "t", .mask_phone = true };
+    const masked = try TransformEngine.maskPhoneIfNeeded(a, "phone", "13800138000", cfg);
+    try std.testing.expect(masked != null);
+    defer a.free(masked.?);
+    try std.testing.expectEqualStrings("138****8000", masked.?);
+}
+
+test "maskPhoneIfNeeded leaves non-phone fields alone" {
+    const a = std.testing.allocator;
+    const cfg: TransformConfig = .{ .mall_id = "m", .source_type = "t", .mask_phone = true };
+    try std.testing.expect((try TransformEngine.maskPhoneIfNeeded(a, "user_id", "12345", cfg)) == null);
+}
+
+test "maskPhoneIfNeeded leaves too-short values alone" {
+    const a = std.testing.allocator;
+    const cfg: TransformConfig = .{ .mall_id = "m", .source_type = "t", .mask_phone = true };
+    try std.testing.expect((try TransformEngine.maskPhoneIfNeeded(a, "phone", "12345", cfg)) == null);
+}
+
+test "maskPhoneIfNeeded disabled when mask_phone=false" {
+    const a = std.testing.allocator;
+    const cfg: TransformConfig = .{ .mall_id = "m", .source_type = "t" };
+    try std.testing.expect((try TransformEngine.maskPhoneIfNeeded(a, "phone", "13800138000", cfg)) == null);
 }
