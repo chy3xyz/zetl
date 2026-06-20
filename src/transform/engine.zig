@@ -219,6 +219,24 @@ fn parseNamingRule(value: std.json.Value, allocator: std.mem.Allocator) !?mapper
     return parseSingleNamingRule(value, allocator);
 }
 
+/// 邮箱脱敏: 切到 '@', local-part 除首字符外全部替换为 '*'.
+/// 例: "alice@example.com" -> "a****@example.com".
+/// 条件: 恰好一个 '@', local 部分 > 2 字符. 不满足返回 null (不修改).
+fn maskEmailValue(allocator: std.mem.Allocator, value: []const u8) !?[]u8 {
+    const at = std.mem.indexOfScalar(u8, value, '@') orelse return null;
+    // 只接受恰好一个 '@'
+    if (std.mem.indexOfScalarPos(u8, value, at + 1, '@') != null) return null;
+    const local = value[0..at];
+    const domain = value[at..];
+    if (local.len <= 2) return null;
+    const stars: usize = local.len - 1;
+    const out = try allocator.alloc(u8, 1 + stars + domain.len);
+    @memcpy(out[0..1], local[0..1]);
+    for (0..stars) |i| out[1 + i] = '*';
+    @memcpy(out[1 + stars ..][0..domain.len], domain);
+    return out;
+}
+
 pub const FilterOp = enum { eq, ne, gt, gte, lt, lte };
 
 pub const TransformEngine = struct {
@@ -779,4 +797,32 @@ test "maskPhoneIfNeeded disabled when mask_phone=false" {
     const a = std.testing.allocator;
     const cfg: TransformConfig = .{ .mall_id = "m", .source_type = "t" };
     try std.testing.expect((try TransformEngine.maskPhoneIfNeeded(a, "phone", "13800138000", cfg)) == null);
+}
+
+test "maskEmailValue masks local-part middle" {
+    const a = std.testing.allocator;
+    const masked = try maskEmailValue(a, "alice@example.com");
+    try std.testing.expect(masked != null);
+    defer a.free(masked.?);
+    try std.testing.expectEqualStrings("a****@example.com", masked.?);
+}
+
+test "maskEmailValue masks long local-part correctly" {
+    const a = std.testing.allocator;
+    const masked = try maskEmailValue(a, "test.user@gmail.com");
+    try std.testing.expect(masked != null);
+    defer a.free(masked.?);
+    try std.testing.expectEqualStrings("t********@gmail.com", masked.?);
+}
+
+test "maskEmailValue leaves short local alone" {
+    const a = std.testing.allocator;
+    try std.testing.expect((try maskEmailValue(a, "a@b.com")) == null);
+    try std.testing.expect((try maskEmailValue(a, "ab@example.com")) == null);
+}
+
+test "maskEmailValue leaves non-email alone" {
+    const a = std.testing.allocator;
+    try std.testing.expect((try maskEmailValue(a, "not-an-email")) == null);
+    try std.testing.expect((try maskEmailValue(a, "a@@b.com")) == null);
 }
