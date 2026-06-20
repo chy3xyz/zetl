@@ -120,6 +120,19 @@ pub const TransformConfig = struct {
         if (transform.get("mask_phone")) |mp| {
             if (mp == .bool) cfg.mask_phone = mp.bool;
         }
+        // Phase 11 扩展 mask 开关
+        if (transform.get("mask_email")) |v| {
+            if (v == .bool) cfg.mask_email = v.bool;
+        }
+        if (transform.get("mask_id_card")) |v| {
+            if (v == .bool) cfg.mask_id_card = v.bool;
+        }
+        if (transform.get("mask_all")) |v| {
+            if (v == .bool) cfg.mask_all = v.bool;
+        }
+        if (transform.get("case_insensitive_fields")) |v| {
+            if (v == .bool) cfg.case_insensitive_fields = v.bool;
+        }
 
         return cfg;
     }
@@ -947,4 +960,56 @@ test "case_insensitive_fields=false reverts to case-sensitive" {
     const cfg: TransformConfig = .{ .mall_id = "m", .source_type = "t", .mask_phone = true, .case_insensitive_fields = false };
     try std.testing.expectEqual(MaskKind.phone, detectMaskKind("phone", cfg));
     try std.testing.expectEqual(MaskKind.none, detectMaskKind("Phone", cfg));
+}
+
+test "TransformConfig parses transform.mask_email from json" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"transform":{"mask_email":true}}
+    , .{});
+    defer parsed.deinit();
+
+    const cfg = try TransformConfig.initFromJson(a, parsed.value);
+    defer cfg.deinit(a);
+    try std.testing.expect(cfg.mask_email == true);
+    try std.testing.expect(cfg.mask_phone == false);
+}
+
+test "TransformConfig parses transform.mask_id_card from json" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"transform":{"mask_id_card":true}}
+    , .{});
+    defer parsed.deinit();
+
+    const cfg = try TransformConfig.initFromJson(a, parsed.value);
+    defer cfg.deinit(a);
+    try std.testing.expect(cfg.mask_id_card == true);
+}
+
+test "TransformConfig parses transform.mask_all from json" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"transform":{"mask_all":true}}
+    , .{});
+    defer parsed.deinit();
+
+    const cfg = try TransformConfig.initFromJson(a, parsed.value);
+    defer cfg.deinit(a);
+    try std.testing.expect(cfg.mask_all == true);
+    try std.testing.expectEqual(MaskKind.phone, detectMaskKind("phone", cfg));
+    try std.testing.expectEqual(MaskKind.email, detectMaskKind("email", cfg));
+    try std.testing.expectEqual(MaskKind.id_card, detectMaskKind("id_card", cfg));
+}
+
+test "TransformConfig case_insensitive_fields defaults to true" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"transform":{}}
+    , .{});
+    defer parsed.deinit();
+
+    const cfg = try TransformConfig.initFromJson(a, parsed.value);
+    defer cfg.deinit(a);
+    try std.testing.expect(cfg.case_insensitive_fields == true);
 }
