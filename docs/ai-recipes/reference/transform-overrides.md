@@ -39,3 +39,21 @@
 - 想跳过 `naming_rule` 的某些列, 在 `field_mappings_json` 里写 `target = source` 即可.
 
 详见 `dev.md` Phase 6 section.
+
+## 快捷开关
+
+### `transform.mask_phone = true` (Phase 10 起)
+
+替代手写 `field_mappings_json` 来脱敏手机号. 自动识别字段名包含 `phone` / `mobile` / `tel` 的列, 把 ≥ 7 位数字值的中间 4 位替换成 `****`.
+
+```json
+{
+  "transform": {
+    "mask_phone": true
+  }
+}
+```
+
+例: `phone = "13800138000"` → `"138****8000"`. 与 `field_mappings_json` 不冲突 (override 优先).
+
+非 phone 字段 (`user_id`, `register_time` 等) 不变.

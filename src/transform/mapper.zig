@@ -15,8 +15,14 @@ pub const FieldMapping = struct {
 /// Source schema 列元数据, 用于自动生成默认映射.
 pub const ColumnMeta = struct {
     name: []const u8,
-    /// MySQL 类型常量 (可选, 暂未使用).
+    /// MySQL 类型常量字节 (来自 protocol / SHOW COLUMNS 解析).
     type: u8 = 0,
+    /// VARCHAR/CHAR 字符数 (来自 `varchar(N)` / `char(N)` 部分).
+    length: ?u16 = null,
+    /// DECIMAL precision (来自 `decimal(P,S)` 部分).
+    precision: ?u8 = null,
+    /// DECIMAL scale (来自 `decimal(P,S)` 部分).
+    scale: ?u8 = null,
 };
 
 pub const RegexReplace = struct {

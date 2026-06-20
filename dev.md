@@ -159,6 +159,38 @@ regex_replace 支持 backref (`$1`, `$2` 等).
 - 修复 Phase 6c 留下的 2 个测试内存泄漏 (`parseNamingRule handles object form add_prefix/strip_prefix`): 加 `defer freeRule(a, rule)`, `zig build test` 从 "2 leaked" → "0 leaked".
 - README.md 新增"面向 AI 业务场景搭建"section, 链接到 `docs/ai-recipes/` 决策树, 让新用户能发现 AI 速搭文档.
 
+## Phase 10: Phase 7b precision + mask_phone
+
+落地 ai-recipes 中两个标为"待实现"的功能, 让文档与代码 100% 对齐.
+
+### Phase 7b: 自动 VARCHAR(N) / DECIMAL(P,S)
+
+`ColumnMeta` 扩展为带 `length: ?u16` / `precision: ?u8` / `scale: ?u8`.
+
+- `parseMySqlTypeString` 返回 `ParsedType` 结构体, 解析 `int(11)` / `varchar(64)` / `decimal(10,2)` 括号内的数字.
+- `fetchSourceColumns` 把 length/precision/scale 填进 `ColumnMeta`.
+- `mySqlTypeName` 接受 length/precision/scale 参数, 通过栈 buffer (`[32]u8`) 生成精确类型字符串.
+- `buildCreateTable` 用真实长度/精度生成 DDL, 不再强制 `VARCHAR(255)`.
+
+效果: 源 `order_no VARCHAR(32)` → 目标 `` `order_no` VARCHAR(32) ``, 不再退化为 `VARCHAR(255)`.
+
+### `transform.mask_phone = true`
+
+`TransformConfig.mask_phone: bool` 简写, 在 `process()` 中识别字段名含 `phone` / `mobile` / `tel` 的列, 把 ≥ 7 位数字值的中间 4 位替换成 `****`:
+
+- `phone = "13800138000"` → `"138****8000"`
+- 非 phone 字段 (`user_id`, `register_time`) 不变
+- 与 `field_mappings_json` 不冲突 (override 优先)
+- 字段名匹配是大小写敏感 (Phase 11 改成 case-insensitive)
+- `TransformConfig.initFromJson` 解析 `transform.mask_phone: bool`
+
+### ai-recipes 文档修正
+
+- `order-sync.md` filter 说明: 不再标"Phase 9 待实现", 给真实 `filter_field/filter_op/filter_value` JSON 例子
+- `user-sync.md` mask_phone: 用 `transform.mask_phone = true` 替代 `field_mappings_json` 手工脱敏
+- `transform-overrides.md`: 新增"快捷开关"section 解释 mask_phone
+- `sink-ddl.md`: 删除"Phase 7b 待实现"section, 改为"已实现"说明
+
 ## Phase 8: 鉴权覆盖 (Auth coverage)
 
 Phase 5 引入的 `/api/tasks/*` 端点此前**绕过鉴权中间件** (注释 "暂不鉴权"). Phase 8 修复这个安全漏洞: 给 6 个端点加 `authInterceptor` + `permissionInterceptor`, 与 V1 `/api/v1/task/*` 对齐.

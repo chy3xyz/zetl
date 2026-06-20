@@ -458,49 +458,60 @@ pub const SyncTask = struct {
             const row = result.getCurrentRowMap() orelse continue;
             const field_name = row.get("Field") orelse return error.MissingColumnName;
             const type_str = row.get("Type") orelse "";
-            const type_byte = parseMySqlTypeString(type_str);
+            const parsed_type = parseMySqlTypeString(type_str);
             try list.append(self.allocator, .{
                 .name = try self.allocator.dupe(u8, field_name),
-                .type = type_byte,
+                .type = parsed_type.type_byte,
+                .length = parsed_type.length,
+                .precision = parsed_type.precision,
+                .scale = parsed_type.scale,
             });
         }
 
         return list.toOwnedSlice(self.allocator);
     }
 
-    /// 解析 SHOW COLUMNS 返回的 Type 字符串 (如 "int(11) unsigned", "varchar(255)", "datetime")
-    /// 转 MySQL 类型字节. 未知类型返回 0xff (建表时 fallback TEXT, 由 schema_ddl.mySqlTypeName 处理).
-    fn parseMySqlTypeString(type_str: []const u8) u8 {
+    const ParsedType = struct {
+        type_byte: u8,
+        length: ?u16 = null,
+        precision: ?u8 = null,
+        scale: ?u8 = null,
+    };
+
+    /// 解析 SHOW COLUMNS 返回的 Type 字符串 (如 "int(11) unsigned", "varchar(255)", "decimal(10,2)", "datetime")
+    /// 返回 ParsedType 含类型字节 + 可选 length / precision / scale.
+    /// 未知类型返回 `{ .type_byte = 0xff, ... }` (建表时 fallback TEXT).
+    pub fn parseMySqlTypeString(type_str: []const u8) ParsedType {
         // 取括号 / 空格前的关键字部分 ("int(11) unsigned" -> "int", "datetime" -> "datetime").
         var end: usize = 0;
         while (end < type_str.len and type_str[end] != '(' and type_str[end] != ' ') : (end += 1) {}
         const keyword = type_str[0..end];
 
-        if (std.mem.eql(u8, keyword, "tinyint")) return 0x01;
-        if (std.mem.eql(u8, keyword, "smallint")) return 0x02;
-        if (std.mem.eql(u8, keyword, "int")) return 0x03;
-        if (std.mem.eql(u8, keyword, "mediumint")) return 0x09;
-        if (std.mem.eql(u8, keyword, "bigint")) return 0x08;
-        if (std.mem.eql(u8, keyword, "float")) return 0x04;
-        if (std.mem.eql(u8, keyword, "double")) return 0x05;
-        if (std.mem.eql(u8, keyword, "decimal")) return 0xf6;
-        if (std.mem.eql(u8, keyword, "date")) return 0x0a;
-        if (std.mem.eql(u8, keyword, "time")) return 0x0b;
-        if (std.mem.eql(u8, keyword, "datetime")) return 0x12;
-        if (std.mem.eql(u8, keyword, "timestamp")) return 0x11;
-        if (std.mem.eql(u8, keyword, "year")) return 0x0d;
-        if (std.mem.eql(u8, keyword, "varchar")) return 0x0f;
-        if (std.mem.eql(u8, keyword, "char")) return 0xfe;
-        if (std.mem.eql(u8, keyword, "text")) return 0xfd;
-        if (std.mem.eql(u8, keyword, "tinytext")) return 0xfd;
-        if (std.mem.eql(u8, keyword, "mediumtext")) return 0xfd;
-        if (std.mem.eql(u8, keyword, "longtext")) return 0xfd;
-        if (std.mem.eql(u8, keyword, "blob")) return 0xfc;
-        if (std.mem.eql(u8, keyword, "tinyblob")) return 0xfc;
-        if (std.mem.eql(u8, keyword, "mediumblob")) return 0xfc;
-        if (std.mem.eql(u8, keyword, "longblob")) return 0xfc;
-        if (std.mem.eql(u8, keyword, "json")) return 0xf5;
-        return 0xff; // unknown -> schema_ddl fallback TEXT
+        const type_byte: u8 = if (std.mem.eql(u8, keyword, "tinyint")) 0x01 else if (std.mem.eql(u8, keyword, "smallint")) 0x02 else if (std.mem.eql(u8, keyword, "int")) 0x03 else if (std.mem.eql(u8, keyword, "mediumint")) 0x09 else if (std.mem.eql(u8, keyword, "bigint")) 0x08 else if (std.mem.eql(u8, keyword, "float")) 0x04 else if (std.mem.eql(u8, keyword, "double")) 0x05 else if (std.mem.eql(u8, keyword, "decimal")) 0xf6 else if (std.mem.eql(u8, keyword, "date")) 0x0a else if (std.mem.eql(u8, keyword, "time")) 0x0b else if (std.mem.eql(u8, keyword, "datetime")) 0x12 else if (std.mem.eql(u8, keyword, "timestamp")) 0x11 else if (std.mem.eql(u8, keyword, "year")) 0x0d else if (std.mem.eql(u8, keyword, "varchar")) 0x0f else if (std.mem.eql(u8, keyword, "char")) 0xfe else if (std.mem.eql(u8, keyword, "text")) 0xfd else if (std.mem.eql(u8, keyword, "tinytext")) 0xfd else if (std.mem.eql(u8, keyword, "mediumtext")) 0xfd else if (std.mem.eql(u8, keyword, "longtext")) 0xfd else if (std.mem.eql(u8, keyword, "blob")) 0xfc else if (std.mem.eql(u8, keyword, "tinyblob")) 0xfc else if (std.mem.eql(u8, keyword, "mediumblob")) 0xfc else if (std.mem.eql(u8, keyword, "longblob")) 0xfc else if (std.mem.eql(u8, keyword, "json")) 0xf5 else 0xff; // unknown -> schema_ddl fallback TEXT
+
+        var parsed: ParsedType = .{ .type_byte = type_byte };
+
+        // 解析括号内的参数 (可能 "N" 或 "P,S")
+        if (end < type_str.len and type_str[end] == '(') {
+            const close = std.mem.indexOfScalarPos(u8, type_str, end + 1, ')') orelse return parsed;
+            const inner = type_str[end + 1 .. close];
+            if (std.mem.indexOfScalar(u8, inner, ',')) |comma| {
+                // "P,S" → precision, scale (DECIMAL)
+                if (std.fmt.parseInt(u8, std.mem.trim(u8, inner[0..comma], &std.ascii.whitespace), 10)) |p| {
+                    parsed.precision = p;
+                } else |_| {}
+                if (std.fmt.parseInt(u8, std.mem.trim(u8, inner[comma + 1 ..], &std.ascii.whitespace), 10)) |s| {
+                    parsed.scale = s;
+                } else |_| {}
+            } else {
+                // "N" → length (VARCHAR/CHAR)
+                if (std.fmt.parseInt(u16, std.mem.trim(u8, inner, &std.ascii.whitespace), 10)) |n| {
+                    parsed.length = n;
+                } else |_| {}
+            }
+        }
+
+        return parsed;
     }
 
     fn savePosition(self: *SyncTask) !void {
@@ -655,4 +666,36 @@ test "_pool_deinit_done flag is single-shot" {
     var flag = std.atomic.Value(bool).init(false);
     try std.testing.expectEqual(false, flag.swap(true, .acq_rel));
     try std.testing.expectEqual(true, flag.load(.acquire));
+}
+
+test "parseMySqlTypeString parses int(N) unsigned" {
+    const p = SyncTask.parseMySqlTypeString("int(11) unsigned");
+    try std.testing.expectEqual(@as(u8, 0x03), p.type_byte);
+    try std.testing.expectEqual(@as(?u16, 11), p.length);
+}
+
+test "parseMySqlTypeString parses varchar(N)" {
+    const p = SyncTask.parseMySqlTypeString("varchar(64)");
+    try std.testing.expectEqual(@as(u8, 0x0f), p.type_byte);
+    try std.testing.expectEqual(@as(?u16, 64), p.length);
+}
+
+test "parseMySqlTypeString parses decimal(P,S)" {
+    const p = SyncTask.parseMySqlTypeString("decimal(10,2)");
+    try std.testing.expectEqual(@as(u8, 0xf6), p.type_byte);
+    try std.testing.expectEqual(@as(?u8, 10), p.precision);
+    try std.testing.expectEqual(@as(?u8, 2), p.scale);
+    try std.testing.expect(p.length == null);
+}
+
+test "parseMySqlTypeString parses plain datetime without length" {
+    const p = SyncTask.parseMySqlTypeString("datetime");
+    try std.testing.expectEqual(@as(u8, 0x12), p.type_byte);
+    try std.testing.expect(p.length == null);
+    try std.testing.expect(p.precision == null);
+}
+
+test "parseMySqlTypeString returns 0xff for unknown" {
+    const p = SyncTask.parseMySqlTypeString("geometry");
+    try std.testing.expectEqual(@as(u8, 0xff), p.type_byte);
 }

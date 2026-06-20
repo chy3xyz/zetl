@@ -7,7 +7,7 @@
 ## 前置
 
 - 同 order-sync 基础前置.
-- 脱敏规则硬编码在 `transform` 中 (Phase 9 计划支持自定义表达式).
+- 脱敏规则硬编码在 `transform.mask_phone = true` 中 (Phase 11 计划支持自定义表达式).
 
 ## 源表 `mall_001.users` 结构
 
@@ -63,12 +63,12 @@ CREATE TABLE union_all_user (
 
 ## 字段解读
 
-- `transform.field_mappings_json`: 当前仅支持字段重命名 + 默认值填充; 手机号脱敏是 V6 已知限制, 落地到 Phase 9 (`transform.mask_phone = true` 简写).
+- `transform.field_mappings_json`: 当前仅支持字段重命名 + 默认值填充; 手机号脱敏请用下方的 `mask_phone` 简写.
 - `batch_size = 500`: 用户表无金额计算, 可放大批量.
 
-## Phase 9 简化版 (未来)
+## mask_phone 简写 (Phase 10 起)
 
-Phase 9 落地后, `config_json` 简化成:
+新加 `transform.mask_phone: true` 自动识别 `phone` / `mobile` / `tel` 字段, 把 ≥ 7 位数字中间 4 位替换成 `****`:
 
 ```json
 {
@@ -78,14 +78,44 @@ Phase 9 落地后, `config_json` 简化成:
 }
 ```
 
-届时本文档会更新. 详见 [dev.md](../../../dev.md) Phase 9.
+`phone = "13800138000"` → `phone = "138****8000"`.
+
+非 phone 字段 (`user_id`, `register_time` 等) 不变. 与 `field_mappings_json` 不冲突 (override 优先).
+
+完整 config_json:
+
+```json
+{
+  "name": "user-sync-from-mall-001",
+  "sync_mode": "both",
+  "source": {
+    "host": "polar-001.local", "port": 3306,
+    "user": "etl", "password": "<encrypted>",
+    "db": "mall_001", "table": "users",
+    "mall_id": "mall-001"
+  },
+  "target": {
+    "host": "central.local", "port": 3306,
+    "user": "etl", "password": "<encrypted>",
+    "db": "central", "table": "union_all_user"
+  },
+  "transform": {
+    "mask_phone": true
+  },
+  "sink": {
+    "on_conflict": "replace",
+    "batch_size": 500
+  }
+}
+```
 
 ## 验证步骤
 
 1. 源 `users` 插一行: `INSERT INTO users VALUES (1, '13800138000', NOW(), 100);`
 2. 目标查: `SELECT phone FROM union_all_user WHERE id = 1;`
-   - 期望 `phone = '****'` (Phase 9 落地后) 或保留原始 (Phase 6c 当前).
+   - 期望 `phone = '138****8000'`.
 
 ## 已知限制
 
-- 当前 `field_mappings_json` 不支持表达式, 脱敏在目标端 SQL 层做 (见 `reference/sink-ddl.md`).
+- `transform.mask_phone` 字段名匹配是大小写敏感 (Phase 11 改成 case-insensitive).
+- 子串 `tel` 会命中 `hotel`, `platform` 等无关列, 属于 Phase 10 的 best-effort 简化.
