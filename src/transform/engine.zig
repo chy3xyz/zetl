@@ -219,6 +219,12 @@ fn parseNamingRule(value: std.json.Value, allocator: std.mem.Allocator) !?mapper
     return parseSingleNamingRule(value, allocator);
 }
 
+/// 判断字符串是否全是 ASCII 数字.
+fn isAllDigits(s: []const u8) bool {
+    for (s) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
 /// 邮箱脱敏: 切到 '@', local-part 除首字符外全部替换为 '*'.
 /// 例: "alice@example.com" -> "a****@example.com".
 /// 条件: 恰好一个 '@', local 部分 > 2 字符. 不满足返回 null (不修改).
@@ -235,6 +241,19 @@ fn maskEmailValue(allocator: std.mem.Allocator, value: []const u8) !?[]u8 {
     for (0..stars) |i| out[1 + i] = '*';
     @memcpy(out[1 + stars ..][0..domain.len], domain);
     return out;
+}
+
+/// 身份证号脱敏: 18 位数字 (中国二代证) 把第 7-14 位 (生日) 替换为 '*'.
+/// 例: "110101199001011234" -> "110101********1234".
+/// 非 18 位纯数字返回 null.
+fn maskIdCardValue(allocator: std.mem.Allocator, value: []const u8) !?[]u8 {
+    if (value.len != 18) return null;
+    if (!isAllDigits(value)) return null;
+    var buf: [18]u8 = undefined;
+    @memcpy(buf[0..6], value[0..6]);
+    for (6..14) |i| buf[i] = '*';
+    @memcpy(buf[14..18], value[14..18]);
+    return @as(?[]u8, try allocator.dupe(u8, &buf));
 }
 
 pub const FilterOp = enum { eq, ne, gt, gte, lt, lte };
@@ -480,12 +499,6 @@ pub const TransformEngine = struct {
         if (std.mem.indexOf(u8, name, "mobile") != null) return true;
         if (std.mem.indexOf(u8, name, "tel") != null) return true;
         return false;
-    }
-
-    /// 判断字符串是否全是 ASCII 数字.
-    fn isAllDigits(s: []const u8) bool {
-        for (s) |c| if (c < '0' or c > '9') return false;
-        return true;
     }
 
     /// 返回 true = 跳过 (filter 不通过)
@@ -825,4 +838,28 @@ test "maskEmailValue leaves non-email alone" {
     const a = std.testing.allocator;
     try std.testing.expect((try maskEmailValue(a, "not-an-email")) == null);
     try std.testing.expect((try maskEmailValue(a, "a@@b.com")) == null);
+}
+
+test "maskIdCardValue masks middle 8 digits" {
+    const a = std.testing.allocator;
+    const masked = try maskIdCardValue(a, "110101199001011234");
+    try std.testing.expect(masked != null);
+    defer a.free(masked.?);
+    try std.testing.expectEqualStrings("110101********1234", masked.?);
+}
+
+test "maskIdCardValue leaves 15-digit old IDs alone" {
+    const a = std.testing.allocator;
+    try std.testing.expect((try maskIdCardValue(a, "110101900101123")) == null);
+}
+
+test "maskIdCardValue leaves non-18-digit alone" {
+    const a = std.testing.allocator;
+    try std.testing.expect((try maskIdCardValue(a, "1234567890123456789")) == null);
+    try std.testing.expect((try maskIdCardValue(a, "")) == null);
+}
+
+test "maskIdCardValue leaves non-digits alone" {
+    const a = std.testing.allocator;
+    try std.testing.expect((try maskIdCardValue(a, "11010119900101123X")) == null);
 }
