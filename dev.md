@@ -205,3 +205,30 @@ Phase 5 引入的 `/api/tasks/*` 端点此前**绕过鉴权中间件** (注释 "
 无 token → 401; 携带 viewer token 但缺少权限 → 403; admin/operator token → 200/201.
 
 新增单元测试覆盖 `isPublicPath` 的公开/私有路径判定.
+
+## Phase 11: 扩展 mask + 大小写不敏感
+
+扩展 Phase 10 的 mask 机制, 覆盖 email 和身份证号, 修复 case-sensitive 限制.
+
+### 新增 mask 类型
+
+- `transform.mask_email = true` — 邮箱字段脱敏 (`alice@example.com` → `a****@example.com`).
+  - 切到 `@`, local-part 除首字符外全部替换为 `*`. local ≤ 2 字符不变 (避免过度脱敏).
+  - 仅识别字段名含 `email` / `mail` 的列.
+- `transform.mask_id_card = true` — 18 位身份证号脱敏 (`110101199001011234` → `110101********1234`).
+  - 仅识别字段名含 `id_card` / `idcard` / `id_no` / `idnum` / `identity` 的列 (不命中 `user_id`).
+  - 非 18 位纯数字不变.
+
+### 简写开关
+
+- `transform.mask_all = true` — 等价于 `mask_phone + mask_email + mask_id_card` 全开.
+
+### 大小写不敏感
+
+- 新增 `case_insensitive_fields: bool = true` (默认 true) 控制字段名匹配是否忽略大小写.
+- `Phone` / `PHONE` / `phone` 都命中 phone mask.
+- 设 `false` 可恢复 Phase 10 的 case-sensitive 行为.
+
+### dispatch 重构
+
+`maskPhoneIfNeeded` 重构为 `maskFieldIfNeeded` + `detectMaskKind` enum dispatch.

@@ -52,6 +52,14 @@ pub const TransformConfig = struct {
 
     /// Phase 10: 自动脱敏 phone / mobile / tel 字段中间 4 位. 默认 false.
     mask_phone: bool = false,
+    /// Phase 11: 自动脱敏 email 字段 (u***@example.com).
+    mask_email: bool = false,
+    /// Phase 11: 自动脱敏 18 位身份证号 (110101********1234).
+    mask_id_card: bool = false,
+    /// Phase 11: 等价于 mask_phone + mask_email + mask_id_card 全开.
+    mask_all: bool = false,
+    /// Phase 11: 字段名匹配是否忽略大小写. 默认 true.
+    case_insensitive_fields: bool = true,
 
     /// 释放 naming_rule 与 naming_rules 中所有堆拥有 slice.
     /// 其他变体 (identity / camel_to_snake / snake_to_camel / upper / lower)
@@ -111,6 +119,19 @@ pub const TransformConfig = struct {
         // mask_phone (Phase 10)
         if (transform.get("mask_phone")) |mp| {
             if (mp == .bool) cfg.mask_phone = mp.bool;
+        }
+        // Phase 11 扩展 mask 开关
+        if (transform.get("mask_email")) |v| {
+            if (v == .bool) cfg.mask_email = v.bool;
+        }
+        if (transform.get("mask_id_card")) |v| {
+            if (v == .bool) cfg.mask_id_card = v.bool;
+        }
+        if (transform.get("mask_all")) |v| {
+            if (v == .bool) cfg.mask_all = v.bool;
+        }
+        if (transform.get("case_insensitive_fields")) |v| {
+            if (v == .bool) cfg.case_insensitive_fields = v.bool;
         }
 
         return cfg;
@@ -217,6 +238,86 @@ fn typeStrToRule(s: []const u8) ?mapper_mod.NamingRule {
 /// 顶层 alias, 保持 Phase 6b 既有测试可用.
 fn parseNamingRule(value: std.json.Value, allocator: std.mem.Allocator) !?mapper_mod.NamingRule {
     return parseSingleNamingRule(value, allocator);
+}
+
+/// 判断字符串是否全是 ASCII 数字.
+fn isAllDigits(s: []const u8) bool {
+    for (s) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
+const MaskKind = enum { phone, email, id_card, none };
+
+/// 决定一个字段是否需要 mask + 用哪种 mask. 大小写不敏感由 cfg.case_insensitive_fields 控制 (默认 true).
+fn detectMaskKind(field_name: []const u8, cfg: TransformConfig) MaskKind {
+    // 注意: lower_buf 必须在 blk 外面声明, 否则返回的 slice 指向已释放的栈空间.
+    var lower_buf: [256]u8 = undefined;
+    const name: []const u8 = if (cfg.case_insensitive_fields)
+        std.ascii.lowerString(&lower_buf, field_name)
+    else
+        field_name;
+    const is_phone_enabled = cfg.mask_phone or cfg.mask_all;
+    const is_email_enabled = cfg.mask_email or cfg.mask_all;
+    const is_id_enabled = cfg.mask_id_card or cfg.mask_all;
+
+    if (is_phone_enabled) {
+        if (std.mem.indexOf(u8, name, "phone") != null) return .phone;
+        if (std.mem.indexOf(u8, name, "mobile") != null) return .phone;
+        if (std.mem.indexOf(u8, name, "tel") != null) return .phone;
+    }
+    if (is_email_enabled) {
+        if (std.mem.indexOf(u8, name, "email") != null) return .email;
+        if (std.mem.indexOf(u8, name, "mail") != null) return .email;
+    }
+    if (is_id_enabled) {
+        if (std.mem.indexOf(u8, name, "id_card") != null) return .id_card;
+        if (std.mem.indexOf(u8, name, "idcard") != null) return .id_card;
+        if (std.mem.indexOf(u8, name, "id_no") != null) return .id_card;
+        if (std.mem.indexOf(u8, name, "idnum") != null) return .id_card;
+        if (std.mem.indexOf(u8, name, "identity") != null) return .id_card;
+    }
+    return .none;
+}
+
+/// Phase 11 unified mask dispatcher.
+fn maskFieldIfNeeded(allocator: std.mem.Allocator, field_name: []const u8, value: []const u8, cfg: TransformConfig) !?[]u8 {
+    return switch (detectMaskKind(field_name, cfg)) {
+        .phone => TransformEngine.maskPhoneIfNeeded(allocator, field_name, value, cfg),
+        .email => maskEmailValue(allocator, value),
+        .id_card => maskIdCardValue(allocator, value),
+        .none => null,
+    };
+}
+
+/// 邮箱脱敏: 切到 '@', local-part 除首字符外全部替换为 '*'.
+/// 例: "alice@example.com" -> "a****@example.com".
+/// 条件: 恰好一个 '@', local 部分 > 2 字符. 不满足返回 null (不修改).
+fn maskEmailValue(allocator: std.mem.Allocator, value: []const u8) !?[]u8 {
+    const at = std.mem.indexOfScalar(u8, value, '@') orelse return null;
+    // 只接受恰好一个 '@'
+    if (std.mem.indexOfScalarPos(u8, value, at + 1, '@') != null) return null;
+    const local = value[0..at];
+    const domain = value[at..];
+    if (local.len <= 2) return null;
+    const stars: usize = local.len - 1;
+    const out = try allocator.alloc(u8, 1 + stars + domain.len);
+    @memcpy(out[0..1], local[0..1]);
+    for (0..stars) |i| out[1 + i] = '*';
+    @memcpy(out[1 + stars ..][0..domain.len], domain);
+    return out;
+}
+
+/// 身份证号脱敏: 18 位数字 (中国二代证) 把第 7-14 位 (生日) 替换为 '*'.
+/// 例: "110101199001011234" -> "110101********1234".
+/// 非 18 位纯数字返回 null.
+fn maskIdCardValue(allocator: std.mem.Allocator, value: []const u8) !?[]u8 {
+    if (value.len != 18) return null;
+    if (!isAllDigits(value)) return null;
+    var buf: [18]u8 = undefined;
+    @memcpy(buf[0..6], value[0..6]);
+    for (6..14) |i| buf[i] = '*';
+    @memcpy(buf[14..18], value[14..18]);
+    return @as(?[]u8, try allocator.dupe(u8, &buf));
 }
 
 pub const FilterOp = enum { eq, ne, gt, gte, lt, lte };
@@ -462,12 +563,6 @@ pub const TransformEngine = struct {
         if (std.mem.indexOf(u8, name, "mobile") != null) return true;
         if (std.mem.indexOf(u8, name, "tel") != null) return true;
         return false;
-    }
-
-    /// 判断字符串是否全是 ASCII 数字.
-    fn isAllDigits(s: []const u8) bool {
-        for (s) |c| if (c < '0' or c > '9') return false;
-        return true;
     }
 
     /// 返回 true = 跳过 (filter 不通过)
@@ -779,4 +874,142 @@ test "maskPhoneIfNeeded disabled when mask_phone=false" {
     const a = std.testing.allocator;
     const cfg: TransformConfig = .{ .mall_id = "m", .source_type = "t" };
     try std.testing.expect((try TransformEngine.maskPhoneIfNeeded(a, "phone", "13800138000", cfg)) == null);
+}
+
+test "maskEmailValue masks local-part middle" {
+    const a = std.testing.allocator;
+    const masked = try maskEmailValue(a, "alice@example.com");
+    try std.testing.expect(masked != null);
+    defer a.free(masked.?);
+    try std.testing.expectEqualStrings("a****@example.com", masked.?);
+}
+
+test "maskEmailValue masks long local-part correctly" {
+    const a = std.testing.allocator;
+    const masked = try maskEmailValue(a, "test.user@gmail.com");
+    try std.testing.expect(masked != null);
+    defer a.free(masked.?);
+    try std.testing.expectEqualStrings("t********@gmail.com", masked.?);
+}
+
+test "maskEmailValue leaves short local alone" {
+    const a = std.testing.allocator;
+    try std.testing.expect((try maskEmailValue(a, "a@b.com")) == null);
+    try std.testing.expect((try maskEmailValue(a, "ab@example.com")) == null);
+}
+
+test "maskEmailValue leaves non-email alone" {
+    const a = std.testing.allocator;
+    try std.testing.expect((try maskEmailValue(a, "not-an-email")) == null);
+    try std.testing.expect((try maskEmailValue(a, "a@@b.com")) == null);
+}
+
+test "maskIdCardValue masks middle 8 digits" {
+    const a = std.testing.allocator;
+    const masked = try maskIdCardValue(a, "110101199001011234");
+    try std.testing.expect(masked != null);
+    defer a.free(masked.?);
+    try std.testing.expectEqualStrings("110101********1234", masked.?);
+}
+
+test "maskIdCardValue leaves 15-digit old IDs alone" {
+    const a = std.testing.allocator;
+    try std.testing.expect((try maskIdCardValue(a, "110101900101123")) == null);
+}
+
+test "maskIdCardValue leaves non-18-digit alone" {
+    const a = std.testing.allocator;
+    try std.testing.expect((try maskIdCardValue(a, "1234567890123456789")) == null);
+    try std.testing.expect((try maskIdCardValue(a, "")) == null);
+}
+
+test "maskIdCardValue leaves non-digits alone" {
+    const a = std.testing.allocator;
+    try std.testing.expect((try maskIdCardValue(a, "11010119900101123X")) == null);
+}
+
+test "detectMaskKind matches phone case-insensitively" {
+    const cfg: TransformConfig = .{ .mall_id = "m", .source_type = "t", .mask_phone = true };
+    try std.testing.expectEqual(MaskKind.phone, detectMaskKind("Phone", cfg));
+    try std.testing.expectEqual(MaskKind.phone, detectMaskKind("PHONE", cfg));
+    try std.testing.expectEqual(MaskKind.phone, detectMaskKind("mobile_NO", cfg));
+    try std.testing.expectEqual(MaskKind.none, detectMaskKind("user_id", cfg));
+}
+
+test "detectMaskKind matches email" {
+    const cfg: TransformConfig = .{ .mall_id = "m", .source_type = "t", .mask_email = true };
+    try std.testing.expectEqual(MaskKind.email, detectMaskKind("email", cfg));
+    try std.testing.expectEqual(MaskKind.email, detectMaskKind("USER_EMAIL", cfg));
+}
+
+test "detectMaskKind matches id_card" {
+    const cfg: TransformConfig = .{ .mall_id = "m", .source_type = "t", .mask_id_card = true };
+    try std.testing.expectEqual(MaskKind.id_card, detectMaskKind("id_card", cfg));
+    try std.testing.expectEqual(MaskKind.id_card, detectMaskKind("IDCardNo", cfg));
+    try std.testing.expectEqual(MaskKind.none, detectMaskKind("user_id", cfg));
+}
+
+test "mask_all enables all three kinds" {
+    const cfg: TransformConfig = .{ .mall_id = "m", .source_type = "t", .mask_all = true };
+    try std.testing.expectEqual(MaskKind.phone, detectMaskKind("phone", cfg));
+    try std.testing.expectEqual(MaskKind.email, detectMaskKind("email", cfg));
+    try std.testing.expectEqual(MaskKind.id_card, detectMaskKind("id_card", cfg));
+}
+
+test "case_insensitive_fields=false reverts to case-sensitive" {
+    const cfg: TransformConfig = .{ .mall_id = "m", .source_type = "t", .mask_phone = true, .case_insensitive_fields = false };
+    try std.testing.expectEqual(MaskKind.phone, detectMaskKind("phone", cfg));
+    try std.testing.expectEqual(MaskKind.none, detectMaskKind("Phone", cfg));
+}
+
+test "TransformConfig parses transform.mask_email from json" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"transform":{"mask_email":true}}
+    , .{});
+    defer parsed.deinit();
+
+    const cfg = try TransformConfig.initFromJson(a, parsed.value);
+    defer cfg.deinit(a);
+    try std.testing.expect(cfg.mask_email == true);
+    try std.testing.expect(cfg.mask_phone == false);
+}
+
+test "TransformConfig parses transform.mask_id_card from json" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"transform":{"mask_id_card":true}}
+    , .{});
+    defer parsed.deinit();
+
+    const cfg = try TransformConfig.initFromJson(a, parsed.value);
+    defer cfg.deinit(a);
+    try std.testing.expect(cfg.mask_id_card == true);
+}
+
+test "TransformConfig parses transform.mask_all from json" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"transform":{"mask_all":true}}
+    , .{});
+    defer parsed.deinit();
+
+    const cfg = try TransformConfig.initFromJson(a, parsed.value);
+    defer cfg.deinit(a);
+    try std.testing.expect(cfg.mask_all == true);
+    try std.testing.expectEqual(MaskKind.phone, detectMaskKind("phone", cfg));
+    try std.testing.expectEqual(MaskKind.email, detectMaskKind("email", cfg));
+    try std.testing.expectEqual(MaskKind.id_card, detectMaskKind("id_card", cfg));
+}
+
+test "TransformConfig case_insensitive_fields defaults to true" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"transform":{}}
+    , .{});
+    defer parsed.deinit();
+
+    const cfg = try TransformConfig.initFromJson(a, parsed.value);
+    defer cfg.deinit(a);
+    try std.testing.expect(cfg.case_insensitive_fields == true);
 }

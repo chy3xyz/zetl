@@ -66,23 +66,22 @@ CREATE TABLE union_all_user (
 - `transform.field_mappings_json`: 当前仅支持字段重命名 + 默认值填充; 手机号脱敏请用下方的 `mask_phone` 简写.
 - `batch_size = 500`: 用户表无金额计算, 可放大批量.
 
-## mask_phone 简写 (Phase 10 起)
+## mask 快捷开关 (Phase 10/11)
 
-新加 `transform.mask_phone: true` 自动识别 `phone` / `mobile` / `tel` 字段, 把 ≥ 7 位数字中间 4 位替换成 `****`:
+支持 4 种 mask:
 
-```json
-{
-  "transform": {
-    "mask_phone": true
-  }
-}
-```
+- `transform.mask_phone = true` — 脱敏 phone/mobile/tel 字段 (中间 4 位换 `****`)
+- `transform.mask_email = true` — 脱敏 email 字段 (local-part 中间换 `*`)
+- `transform.mask_id_card = true` — 脱敏 id_card/idcard/id_no/identity 字段 (中间 8 位换 `*`)
+- `transform.mask_all = true` — 等价于上面 3 个全开
 
-`phone = "13800138000"` → `phone = "138****8000"`.
+### 字段匹配规则
 
-非 phone 字段 (`user_id`, `register_time` 等) 不变. 与 `field_mappings_json` 不冲突 (override 优先).
+- 默认大小写不敏感 (`case_insensitive_fields: true`): `Phone` / `PHONE` / `phone` 都命中
+- 字段名匹配是子串 (含 `phone` / `mobile` / `tel` 等关键词)
+- id_card 不会误命中 `user_id` (要求 `id_card` / `idcard` / `id_no` / `idnum` / `identity` 子串)
 
-完整 config_json:
+### 完整 user-sync config_json (含 mask_all)
 
 ```json
 {
@@ -100,7 +99,7 @@ CREATE TABLE union_all_user (
     "db": "central", "table": "union_all_user"
   },
   "transform": {
-    "mask_phone": true
+    "mask_all": true
   },
   "sink": {
     "on_conflict": "replace",
@@ -108,6 +107,8 @@ CREATE TABLE union_all_user (
   }
 }
 ```
+
+`phone = "13800138000"` → `"138****8000"`, `email = "alice@example.com"` → `"a****@example.com"`, `id_card = "110101199001011234"` → `"110101********1234"`.
 
 ## 验证步骤
 
@@ -117,5 +118,4 @@ CREATE TABLE union_all_user (
 
 ## 已知限制
 
-- `transform.mask_phone` 字段名匹配是大小写敏感 (Phase 11 改成 case-insensitive).
-- 子串 `tel` 会命中 `hotel`, `platform` 等无关列, 属于 Phase 10 的 best-effort 简化.
+- 子串 `tel` 会命中 `hotel`, `platform` 等无关列, 属于 best-effort 简化.
