@@ -97,7 +97,19 @@ CREATE TABLE union_all_order (
 
 ### 想加 update_time 过滤 (只同步已支付订单)
 
-等 Phase 9 `transform.filter` 落地 (见 [dev.md](../../../dev.md) Phase 9).
+用 V1 已有的 `transform.filter_field` + `filter_op` + `filter_value`:
+
+```json
+{
+  "transform": {
+    "filter_field": "order_status",
+    "filter_op": "gte",
+    "filter_value": "1"
+  }
+}
+```
+
+`filter_op` 取值: `eq, ne, gt, gte, lt, lte`. 详见 [dev.md](../../../dev.md) "稳定性修复" section.
 
 ### 想从 30 套 PolarDB 一起同步
 

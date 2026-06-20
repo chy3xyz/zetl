@@ -34,10 +34,16 @@ ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 - DECIMAL precision/scale 用默认值 (10, 2).
 - 不支持 BIT / ENUM / SET / GEOMETRY (Phase 3 未实现).
 
-## 已知限制解除 (Phase 7b, 待实现)
+## Phase 7b: 自动 precision (Phase 10 起已实现)
 
-- 从 `SHOW COLUMNS FROM source.table` 解析长度 / precision / scale.
-- 兜底: 如果自动 DDL 报错, 用 `TEXT` 兜底重试.
+`buildCreateTable` 现在从 `ColumnMeta.length` / `.precision` / `.scale` 生成精确 DDL:
+
+- `VARCHAR(N)` 保留源长度 (不再强制 255)
+- `DECIMAL(P,S)` 保留源 precision/scale (不再强制 18,4)
+- `CHAR(N)` 保留源长度
+- 没有 length/precision 的类型仍走默认 (255 / 18,4)
+
+详见 [dev.md](../../../dev.md) Phase 10 section.
 
 ## 幂等性
 
