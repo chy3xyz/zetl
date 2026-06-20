@@ -1,5 +1,11 @@
 # zetl — Agent Instructions
 
+## 业务场景搭建
+
+如果你的任务是 **为一个新的同步场景写 zetl 配置 JSON** (不是改 zetl 自身代码), 先读 `docs/ai-recipes/README.md` 的决策树. 通常读 1 个 recipe + 1-2 个 reference 就够.
+
+如果你的任务是 **改 zetl 自身代码** (加新模块 / 修 bug / 加测试), 按下面的"构建"和"编码约定"继续.
+
 ## 项目概述
 
 zetl 是一个基于 Zig 0.17 + zfinal v0.10.4 的多源 MySQL 数据归集 ETL 引擎。

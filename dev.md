@@ -140,6 +140,20 @@ regex_replace 支持 backref (`$1`, `$2` 等).
 - binlog / poll 路径自动复用 Phase 6 的 source schema.
 - 已知限制: VARCHAR / CHAR 长度、DECIMAL precision/scale 用默认值; 后续 Phase 7b 支持从 source metadata 推断.
 
+## Phase 9: AI 速搭文档
+
+新增 `docs/ai-recipes/` 文档树, 面向 AI 编程代理, 让 AI 在 5 分钟内为一个新业务场景写出可运行的 `config_json`.
+
+- `README.md` — 决策树 (订单/用户/商品/多源/自定义)
+- `00-task-config-schema.md` — 完整 TaskConfig 字段参考
+- `01-quickstart.md` — 5 行 JSON 最小链路
+- `recipes/` — 4 个场景模板 (order/user/product/multi-source)
+- `reference/` — 4 个速查手册 (naming/overrides/sink/api)
+
+`AGENTS.md` 顶部新增指针: 业务场景搭建先看 `docs/ai-recipes/`, 改 zetl 自身代码按原有约定.
+
+无代码变更. 仅 markdown.
+
 ## Phase 8: 鉴权覆盖 (Auth coverage)
 
 Phase 5 引入的 `/api/tasks/*` 端点此前**绕过鉴权中间件** (注释 "暂不鉴权"). Phase 8 修复这个安全漏洞: 给 6 个端点加 `authInterceptor` + `permissionInterceptor`, 与 V1 `/api/v1/task/*` 对齐.
