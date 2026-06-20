@@ -560,6 +560,7 @@ test "parseNamingRule handles object form add_prefix" {
 
     const rule = try parseNamingRule(parsed.value, a);
     try std.testing.expect(rule != null);
+    defer freeRule(a, rule);
     switch (rule.?) {
         .add_prefix => |p| try std.testing.expectEqualStrings("dt_", p),
         else => return error.UnexpectedRule,
@@ -601,6 +602,7 @@ test "parseNamingRule handles object form strip_prefix" {
 
     const rule = try parseNamingRule(parsed.value, a);
     try std.testing.expect(rule != null);
+    defer freeRule(a, rule);
     switch (rule.?) {
         .strip_prefix => |p| try std.testing.expectEqualStrings("dt_", p),
         else => return error.UnexpectedRule,

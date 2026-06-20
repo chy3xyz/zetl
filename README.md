@@ -19,6 +19,17 @@
 - **RBAC 鉴权** — admin/operator/viewer 三角色, SHA256+salt
 - **HTMX + Alpine.js UI** — 单 HTML @embedFile
 
+## 面向 AI 业务场景搭建
+
+新同步场景? 让 AI 在 5 分钟内帮你写出 zetl 任务配置 JSON:
+
+→ **[docs/ai-recipes/](docs/ai-recipes/)** 决策树
+
+包含:
+- 4 个场景 Recipe (订单 / 用户 / 商品 / 多源汇总)
+- 4 个速查手册 (字段映射 / 列名转换 / Sink / Task API)
+- 完整 TaskConfig 字段参考
+
 ## 快速开始
 
 ```bash
