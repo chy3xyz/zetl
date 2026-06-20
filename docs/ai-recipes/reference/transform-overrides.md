@@ -57,3 +57,31 @@
 例: `phone = "13800138000"` → `"138****8000"`. 与 `field_mappings_json` 不冲突 (override 优先).
 
 非 phone 字段 (`user_id`, `register_time` 等) 不变.
+
+### `transform.mask_email = true` (Phase 11 起)
+
+脱敏 email 字段 (`u***@example.com`). 自动识别字段名含 `email` / `mail` 的列.
+
+```json
+{"transform": {"mask_email": true}}
+```
+
+例: `email = "alice@example.com"` → `"a****@example.com"`. local-part ≤ 2 字符不变 (避免过度脱敏).
+
+### `transform.mask_id_card = true` (Phase 11 起)
+
+脱敏 18 位身份证号 (前 6 + `********` + 后 4). 自动识别字段名含 `id_card` / `idcard` / `id_no` / `idnum` / `identity` 的列 (避免误命中 `user_id`).
+
+```json
+{"transform": {"mask_id_card": true}}
+```
+
+例: `id_card = "110101199001011234"` → `"110101********1234"`. 非 18 位纯数字不变.
+
+### `transform.mask_all = true` (Phase 11 起)
+
+等价于同时启用 `mask_phone` / `mask_email` / `mask_id_card`. 适合"先全部脱敏, 再 field_mappings_json 还原部分字段"的场景.
+
+```json
+{"transform": {"mask_all": true}}
+```
