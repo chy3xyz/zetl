@@ -1,4 +1,4 @@
-//! SyncTask 运行时 — zfinal v0.10.4 + 堆字符串寿命管理
+//! SyncTask 运行时 — zfinal (≥ v0.25, DB.init 返回 *DB) + 堆字符串寿命管理
 
 const std = @import("std");
 const zfinal = @import("zfinal");
@@ -58,7 +58,7 @@ pub const SyncTask = struct {
     _su: []u8,
     _sp: []u8, // 持有 src DBConfig 的 dupe'd 字符串
     /// binlog CDC 用的源库 DB 连接 (P2 Task 11 注入, 当前为 null).
-    binlog_db: ?zfinal.DB = null,
+    binlog_db: ?*zfinal.DB = null,
     /// 当前任务状态. 所有转换: start → running, runLoop 退出 → success/error.
     state: std.atomic.Value(TaskStatus) = std.atomic.Value(TaskStatus).init(.pending),
     /// stop() 翻转此标志, runLoop 检测后优雅退出. 与 state 字段独立 (state 是结果, 这是原因).
@@ -143,7 +143,7 @@ pub const SyncTask = struct {
             .password = src_pass,
         };
         const binlog_db = try zfinal.DB.init(a, binlog_cfg);
-        errdefer binlog_db.deinit();
+        errdefer binlog_db.destroy();
         return .{ .allocator = a, .cfg = cfg, .transformer = tr, .sink = sk, .store = store, .sink_pool = sp, .src_pool = src_pool, .poller = pl, ._sh = src_host, ._sd = src_db, ._su = src_user, ._sp = src_pass, .pos = po, .binlog_db = binlog_db };
     }
 
@@ -172,7 +172,7 @@ pub const SyncTask = struct {
         if (!self._pool_deinit_done.swap(true, .acq_rel)) {
             self.src_pool.deinit();
         }
-        if (self.binlog_db) |*bd| bd.deinit();
+        if (self.binlog_db) |bd| bd.destroy();
         self.allocator.free(self._sh);
         self.allocator.free(self._sd);
         self.allocator.free(self._su);
@@ -331,7 +331,7 @@ pub const SyncTask = struct {
     ///   3. 循环: reader.nextEvent → parser.processEvent → 分发 (rotate / heartbeat / row / table_map / unknown);
     ///   4. 每轮末尾用 reader.currentPosition 更新 self.pos 并 savePosition 持久化.
     fn runBinlogIncremental(self: *SyncTask) !void {
-        const bd = if (self.binlog_db) |*p| p else return error.NoBinlogDb;
+        const bd = self.binlog_db orelse return error.NoBinlogDb;
         common.logger.inf("[task {d}] 启动 binlog CDC", .{self.cfg.task_id});
 
         var reader = cdc.binlog.BinlogReader.init(self.allocator, bd);

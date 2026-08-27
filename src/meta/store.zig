@@ -6,18 +6,19 @@ const zfinal = @import("zfinal");
 
 pub const MetaStore = struct {
     allocator: std.mem.Allocator,
-    db: zfinal.DB,
+    db: *zfinal.DB,
 
     pub fn init(allocator: std.mem.Allocator, sqlite_path: []const u8) !MetaStore {
         const cfg = zfinal.DBConfig.sqlite(sqlite_path);
         const db = try zfinal.DB.init(allocator, cfg);
+        errdefer db.destroy();
         var store = MetaStore{ .allocator = allocator, .db = db };
         try store.createAllTables();
         return store;
     }
 
     pub fn deinit(self: *MetaStore) void {
-        self.db.deinit();
+        self.db.destroy();
     }
 
     fn migrateSyncPosition(self: *MetaStore) !void {

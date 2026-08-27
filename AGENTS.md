@@ -8,10 +8,10 @@
 
 ## 项目概述
 
-zetl 是一个基于 Zig 0.17 + zfinal v0.10.4 的多源 MySQL 数据归集 ETL 引擎。
+zetl 是一个基于 Zig 0.17 + zfinal (master, ≥ v0.23) 的多源 MySQL 数据归集 ETL 引擎。
 
-- **框架**: zfinal 0.10.4 (Web + DB + Token 管理)
-- **编译器**: Zig 0.17-dev.813
+- **框架**: zfinal v0.25.0 (`build.zig.zon` 用 `git+https` 固定 tag + commit, 升级时用 `zig fetch --save=zfinal "git+https://github.com/chy3xyz/zfinal.git?ref=<tag>"` 再手工补 `.hash`; zent v0.31.0 经 zfinal 传递拉取)
+- **编译器**: Zig 0.17.0-dev.1567 (zigup master; `~/.zig` → `~/.local/share/zigup/0.17.0-dev.1567+f0354179a/files`)
 - **架构**: 6 大模块 — common/meta/cdc/transform/sink/engine/web
 - **V2 新增**: reconcile / alarm / metrics / audit / auth (共 13 模块)
 
@@ -49,8 +49,8 @@ ctx.getPathParam("id")           // 路径参数
 ctx.getHeader("Authorization")   // 请求头
 
 // 数据库
-zfinal.DB.init(allocator, config)           // 单连接
-zfinal.ConnectionPool.init(allocator, config, N)  // 连接池 (v0.10.4 返回 *ConnectionPool)
+zfinal.DB.init(allocator, config)           // 单连接, 返回 *DB (堆分配) — 用完调 db.destroy() 而非 deinit()
+zfinal.ConnectionPool.init(allocator, config, N)  // 连接池, 返回 *ConnectionPool
 pool.acquire() / pool.release(conn)         // 获取/归还连接
 ```
 
@@ -61,7 +61,7 @@ pool.acquire() / pool.release(conn)         // 获取/归还连接
 使用 `PollerConfig.fromSlices(host, port, user, pass, db, table, pk, ut, batch)` 创建，内部是 fixed-size buffers (`@splat(0)`)。
 
 ### 线程安全
-- zfinal `ConnectionPool` 在主线程创建后、通过 `*ConnectionPool` 指针传入子线程 — v0.10.4 API。
+- zfinal `ConnectionPool` 在主线程创建后、通过 `*ConnectionPool` 指针传入子线程。
 - **池的 DBConfig 字符串必须堆分配**（不能引用栈），由 `SyncTask._sh/_sd/_su/_sp` 持有寿命。
 
 ### 字符串寿命

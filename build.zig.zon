@@ -5,7 +5,10 @@
     .minimum_zig_version = "0.17.0",
 
     .dependencies = .{
-        .zfinal = .{ .path = "../../zig_ws/zfinal" },
+        .zfinal = .{
+            .url = "git+https://github.com/chy3xyz/zfinal.git?ref=v0.25.0#fa9d4c509eb06224cba18d83250a14ff88ccd843",
+            .hash = "zfinal-0.25.0-6AOMdZ3ybACPNWReg6SKD7rtEKi2pK4pJUO2dovIGguq",
+        },
     },
 
     .paths = .{

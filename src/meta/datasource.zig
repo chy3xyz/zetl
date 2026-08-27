@@ -186,7 +186,7 @@ test "datasource service - insert/find/delete" {
     const a = std.testing.allocator;
     const cfg = zfinal.DBConfig.sqliteMemory();
     var db = try zfinal.DB.init(a, cfg);
-    defer db.deinit();
+    defer db.destroy();
     _ = try db.exec(
         \\CREATE TABLE IF NOT EXISTS datasource (
         \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
