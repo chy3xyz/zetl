@@ -1,4 +1,4 @@
-//! SyncTask 运行时 — zfinal (≥ v0.25, DB.init 返回 *DB) + 堆字符串寿命管理
+//! SyncTask 运行时 — zfinal (≥ v0.27, DB.init 返回 *DB) + 堆字符串寿命管理
 
 const std = @import("std");
 const zfinal = @import("zfinal");

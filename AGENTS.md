@@ -8,10 +8,10 @@
 
 ## 项目概述
 
-zetl 是一个基于 Zig 0.17 + zfinal (master, ≥ v0.23) 的多源 MySQL 数据归集 ETL 引擎。
+zetl 是一个基于 Zig 0.17 + zfinal v0.27.0 的多源 MySQL 数据归集 ETL 引擎。
 
-- **框架**: zfinal v0.25.0 (`build.zig.zon` 用 `git+https` 固定 tag + commit, 升级时用 `zig fetch --save=zfinal "git+https://github.com/chy3xyz/zfinal.git?ref=<tag>"` 再手工补 `.hash`; zent v0.31.0 经 zfinal 传递拉取)
-- **编译器**: Zig 0.17.0-dev.1567 (zigup master; `~/.zig` → `~/.local/share/zigup/0.17.0-dev.1567+f0354179a/files`)
+- **框架**: zfinal v0.27.0 (`build.zig.zon` 用 `git+https` 固定 tag + commit, 升级时用 `zig fetch "git+https://github.com/chy3xyz/zfinal.git?ref=<tag>"` 取 hash 后手工补 `.url`/`.hash`; zent v0.31.0 经 zfinal 传递拉取)
+- **编译器**: Zig 0.17.0-dev.1970 (zigup; `~/.zig` → `~/.local/share/zigup/0.17.0-dev.1970+67f39b551/files`; zfinal v0.26.1+ 要求 1970, 1567 缺 `Io.Operation.net_write`)
 - **架构**: 6 大模块 — common/meta/cdc/transform/sink/engine/web
 - **V2 新增**: reconcile / alarm / metrics / audit / auth (共 13 模块)
 
@@ -89,19 +89,21 @@ const cfg = .{ .host = host }; // 指向堆
    - `DB.init` 在子线程首行可用，但从 `ConnectionPool.acquire` 路径失败
    - 主线程 API (testConnection) 100% 可靠
    - 原因: Zig 0.17-dev 在 aarch64-macos 上的线程局部存储与 mysql C 库交互问题
-   - 进度: zfinal v0.10.4 修复了 mutex 拷贝 (#1), 但 acquire 路径仍有问题
+   - 进度: 上游 v0.25–v0.27 加固了 pool 并发 (burst stress / 事务并发回归测试网, double-release 检测, commit 失败回滚), 但均基于 SQLite 驱动验证; MySQL acquire 路径是否恢复**待实测**
 
 2. **TokenManager validate() 死锁**: V2 绕过，logout 靠客户端丢 token + 服务端 TTL
 
 ## 测试
 
 ```
-71 个单元测试覆盖:
-  crypto (2) / mapper (5) / commission (9, 含 loadCommissionRules 3 个) / engine (2)
-  sink (10) / meta (1) / poller (1) / web (1) / config (2, 含 reconcile 段)
-  auth/role/bcrypt/user (新增) / alarm / reconcile (9 个 cron 新增) / audit / main (2)
+243 个单元测试 (zig build test / zig build -Ddriver_mysql=true test):
+  transform (69) / cdc (47, 含 binlog decoder 22) / auth (25) / engine (22)
+  reconcile (19) / alarm (15) / web (15) / sink (14) / meta (8) / audit (3)
+  main (2) / config (2) / common (2)
 
-SQLite + MySQL 双构建通过
+SQLite + MySQL 双构建通过; 已知怪癖: 重建后首次 zig build test 可能打印
+一行 "failed command" 但退出码为 0 — 0.17.0-dev.1970 构建器对 run step
+的显示噪音 (zfinal 仓库同样现象), 缓存命中后不再出现
 ```
 
 ## P1 任务 1.5: 归集库不可达优雅降级 (2026-06)
