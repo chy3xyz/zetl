@@ -3,11 +3,11 @@
 
 const std = @import("std");
 const zfinal = @import("zfinal");
-const alarm_mod = @import("mod.zig");
-const rule = @import("rule.zig");
-const webhook = @import("webhook.zig");
-const web_deps = @import("../web/deps.zig");
-const response = @import("../web/response.zig");
+const alarm_mod = @import("../../alarm/mod.zig");
+const rule = @import("../../alarm/rule.zig");
+const webhook = @import("../../alarm/webhook.zig");
+const web_deps = @import("../deps.zig");
+const response = @import("../response.zig");
 
 /// GET /api/v1/alarm/config  — 规则列表
 pub fn listConfig(ctx: *zfinal.Context) !void {

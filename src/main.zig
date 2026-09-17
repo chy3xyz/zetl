@@ -102,11 +102,8 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("common/crypto.zig");
     _ = @import("common/logger.zig");
-    _ = @import("common/alarm.zig");
     _ = @import("meta/datasource.zig");
-    _ = @import("meta/task.zig");
-    _ = @import("meta/task/config.zig");
-    _ = @import("meta/task/service.zig");
+    _ = @import("meta/task/mod.zig"); // 含 config / service
     _ = @import("meta/position.zig");
     _ = @import("meta/store.zig");
     _ = @import("cdc/poller.zig");
@@ -120,18 +117,19 @@ test {
     _ = @import("sink/schema_ddl.zig");
     _ = @import("web/auth_middleware.zig");
     _ = @import("reconcile/summary.zig");
-    _ = @import("reconcile/handler.zig");
+    _ = @import("web/handler/reconcile.zig");
     _ = @import("reconcile/cron.zig");
     _ = @import("alarm/rule.zig");
     _ = @import("alarm/webhook.zig");
-    _ = @import("alarm/handler.zig");
+    _ = @import("web/handler/alarm.zig");
     _ = @import("alarm/trigger.zig");
     _ = @import("metrics/prometheus.zig");
-    _ = @import("audit/handler.zig");
+    _ = @import("web/handler/audit.zig");
     _ = @import("auth/bcrypt.zig");
     _ = @import("auth/user.zig");
     _ = @import("auth/role.zig");
-    _ = @import("auth/handler.zig");
+    _ = @import("web/handler/auth.zig");
+    _ = @import("web/handler/tasks.zig");
     _ = @import("config.zig");
 }
 

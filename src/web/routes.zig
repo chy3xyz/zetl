@@ -12,7 +12,7 @@ const auth = @import("handler/auth.zig");
 const datasource = @import("handler/datasource.zig");
 const task = @import("handler/task.zig");
 const monitor = @import("handler/monitor.zig");
-const tasks_api = @import("api/tasks.zig");
+const tasks_api = @import("handler/tasks.zig");
 
 /// 注册所有路由. 启动时调用一次.
 pub fn registerAll(
@@ -31,8 +31,7 @@ pub fn registerAll(
     try app.get("/health", healthHandler);
 
     // 鉴权
-    const auth_handler = @import("../auth/handler.zig");
-    try app.post("/api/v1/auth/login", auth_handler.loginV2);
+    try app.post("/api/v1/auth/login", auth.login);
     try app.get("/api/v1/auth/me", auth.me);
     try app.post("/api/v1/auth/logout", auth.logout);
 
@@ -69,9 +68,9 @@ pub fn registerAll(
     const role_read_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("role:read") };
 
     // 用户管理 (V2.2) — admin 专属 (user:read / user:write / role:read)
-    try app.getWithInterceptors("/api/v1/user", auth_handler.listUsers, &user_read_intc);
-    try app.postWithInterceptors("/api/v1/user", auth_handler.createUser, &user_write_intc);
-    try app.getWithInterceptors("/api/v1/role", auth_handler.listRoles, &role_read_intc);
+    try app.getWithInterceptors("/api/v1/user", auth.listUsers, &user_read_intc);
+    try app.postWithInterceptors("/api/v1/user", auth.createUser, &user_write_intc);
+    try app.getWithInterceptors("/api/v1/role", auth.listRoles, &role_read_intc);
 
     try app.postWithInterceptors("/api/v1/datasource", datasource.create, &datasource_write_intc);
     try app.postWithInterceptors("/api/v1/datasource/test", datasource.testConnection, &datasource_read_intc);
@@ -105,7 +104,7 @@ pub fn registerAll(
     try app.getWithInterceptors("/api/v1/monitor/task/:id", monitor.taskMetrics, &monitor_read_intc);
 
     // 对账 (V2.0)
-    const rec_handler = @import("../reconcile/handler.zig");
+    const rec_handler = @import("handler/reconcile.zig");
     try app.postWithInterceptors("/api/v1/reconcile/run", rec_handler.run, &reconcile_run_intc);
     try app.getWithInterceptors("/api/v1/reconcile/list", rec_handler.list, &reconcile_read_intc);
     try app.getWithInterceptors("/api/v1/reconcile/:id", rec_handler.detail, &reconcile_read_intc);
@@ -113,14 +112,14 @@ pub fn registerAll(
     try app.getWithInterceptors("/api/v1/reconcile/:id/export", rec_handler.exportCsv, &reconcile_read_intc);
 
     // 告警 (V2.1)
-    const alarm_handler = @import("../alarm/handler.zig");
+    const alarm_handler = @import("handler/alarm.zig");
     try app.getWithInterceptors("/api/v1/alarm/config", alarm_handler.listConfig, &alarm_read_intc);
     try app.postWithInterceptors("/api/v1/alarm/config", alarm_handler.createConfig, &alarm_write_intc);
     try app.deleteWithInterceptors("/api/v1/alarm/config/:id", alarm_handler.deleteConfig, &alarm_delete_intc);
     try app.postWithInterceptors("/api/v1/alarm/test", alarm_handler.testAlarm, &alarm_write_intc);
 
     // 审计 (V2.1)
-    const audit_handler = @import("../audit/handler.zig");
+    const audit_handler = @import("handler/audit.zig");
     try app.getWithInterceptors("/api/v1/audit/list", audit_handler.list, &audit_read_intc);
 
     // 健康检查 + 指标 (公开)

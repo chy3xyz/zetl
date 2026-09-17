@@ -1,58 +1,73 @@
-# zetl — 多源 MySQL 数据归集 ETL 引擎
+# zetl — Multi-Source MySQL Aggregation ETL Engine
 
-**基于 Zig 0.17 + [zfinal](https://github.com/zfinal-org/zfinal) 框架的轻量 ETL 引擎**
+A lightweight data aggregation engine that consolidates tables from multiple MySQL sources into a single sink database, built on [Zig 0.17](https://ziglang.org) and the [zfinal](https://github.com/chy3xyz/zfinal) framework.
 
-[![Zig](https://img.shields.io/badge/Zig-0.17-orange)](https://ziglang.org)
-[![zfinal](https://img.shields.io/badge/zfinal-v0.10.4-blue)](https://github.com/zfinal-org/zfinal)
+[![Zig](https://img.shields.io/badge/Zig-0.17.0--dev.1970-orange)](https://ziglang.org)
+[![zfinal](https://img.shields.io/badge/zfinal-v0.27.0-blue)](https://github.com/chy3xyz/zfinal)
+[![Tests](https://img.shields.io/badge/tests-243%20passing-brightgreen)](#testing)
 
-## 特性 (V2)
-
-- **单二进制部署** — 3.8 MB, 包含 Web UI + REST API + ETL 引擎
-- **多源 MySQL 归集** — 多个商城/业务库 → 统一归集库
-- **伪 CDC 轮询** — 主键分页全量 + update_time 增量
-- **字段映射 + 佣金计算** — JSON 配置化, 阶梯佣金规则
-- **幂等写入** — INSERT...ON DUPLICATE KEY UPDATE
-- **定时对账** — Cron 凌晨 2 点 + 增量 diff + CSV 导出
-- **告警推送** — 通用 webhook + 企业微信 Markdown, 5min 冷却
-- **Prometheus 指标** — /metrics, /health/live, /health/ready
-- **操作审计** — 所有写操作自动记录
-- **RBAC 鉴权** — admin/operator/viewer 三角色, SHA256+salt
-- **HTMX + Alpine.js UI** — 单 HTML @embedFile
-
-## 面向 AI 业务场景搭建
-
-新同步场景? 让 AI 在 5 分钟内帮你写出 zetl 任务配置 JSON:
-
-→ **[docs/ai-recipes/](docs/ai-recipes/)** 决策树
-
-包含:
-- 4 个场景 Recipe (订单 / 用户 / 商品 / 多源汇总)
-- 4 个速查手册 (字段映射 / 列名转换 / Sink / Task API)
-- 完整 TaskConfig 字段参考
-
-## 快速开始
-
-```bash
-# 编译 (仅 SQLite 模式, 不连 MySQL)
-zig build
-
-# 编译 + 链接 MySQL (需要 libmysqlclient)
-zig build -Ddriver_mysql=true
-
-# 运行
-./zig-out/bin/zetl
-
-# 测试
-zig build test
+```
+source MySQL ──> Poller (PK pagination / update_time) or Binlog reader ──> RowEvent
+    ──> TransformEngine (mapping + defaults + filters + naming + commission + masking) ──> RowData
+    ──> MySqlSink (batched INSERT ... ON DUPLICATE KEY UPDATE) ──> sink MySQL
 ```
 
-## 配置
+## Features
 
-编辑 `config.toml`:
+- **Single-binary deployment** — ~4.8 MB (ReleaseSafe), bundles the web UI, REST API and ETL engine
+- **Multi-source aggregation** — many business databases → one sink database
+- **Three sync modes** — `poll` (PK pagination for full + `update_time` for incremental), `binlog` (real CDC, tombstone-aware), or `both` (full backfill then incremental)
+- **Automatic schema handling** — source columns discovered via `SHOW COLUMNS`, target table auto-created with exact `VARCHAR(N)` / `DECIMAL(P,S)` types
+- **Transform pipeline** — field mapping with defaults and type overrides, column naming rules (`camel_to_snake`, prefix, regex replace, chained), row filters, tiered commission calculation, PII masking (phone / email / id-card)
+- **Idempotent writes** — batched upserts, safe to re-run
+- **Scheduled reconciliation** — cron-driven row/amount diff between source and sink, CSV export
+- **Alerting** — generic webhook + WeCom Markdown, 5-minute cooldown
+- **Prometheus metrics** — `/metrics`, liveness and readiness probes
+- **Audit log** — every write operation recorded
+- **RBAC** — admin / operator / viewer roles, per-endpoint permissions
+- **Embedded UI** — HTMX + Alpine.js admin console, single embedded HTML
+
+## AI-Assisted Setup
+
+Want to wire up a new sync scenario? The [docs/ai-recipes/](docs/ai-recipes/) decision tree helps an AI coding agent produce a runnable task config JSON in about 5 minutes:
+
+- 4 scenario recipes (orders / users / products / multi-source)
+- 4 quick references (naming rules / field overrides / sink DDL / Task API)
+- Full `TaskConfig` field reference
+
+## Quick Start
+
+Prerequisites: Zig 0.17.0-dev.1970, a MySQL 8.x sink (libmysqlclient), SQLite 3.
+
+```bash
+# Build (SQLite only, no MySQL needed — used for unit tests)
+zig build
+
+# Full build with the MySQL sink driver
+zig build -Ddriver_mysql=true
+
+# Run
+./zig-out/bin/zetl
+
+# Unit tests
+zig build test
+zig build -Ddriver_mysql=true test
+```
+
+## Configuration
+
+Edit `config.toml`:
 
 ```toml
 [server]
+host = "0.0.0.0"
 port = 18080
+
+# Bootstrap admin account (created on first run)
+[meta]
+sqlite_path = "zetl_meta.db"
+admin_username = "admin"
+admin_password = "admin123"
 
 [sink]
 host = "127.0.0.1"
@@ -61,130 +76,138 @@ database = "zetl_sink"
 username = "root"
 password = ""
 pool_size = 8
-batch_size = 1000
-
-[meta]
-sqlite_path = "zetl_meta.db"
+batch_size = 100
+flush_interval_ms = 500
 
 [engine]
 full_sync_sleep_ms = 100
 incremental_poll_ms = 2000
+max_retries = 3
 
 [log]
 level = "info"
+
+[reconcile]
+enabled = true
+# @hourly / @daily / @weekly / @monthly / @yearly, or a 5-field cron
+cron_expr = "0 2 * * *"
+poll_interval_s = 60
 ```
 
-## API 端点 (33 个)
+## API (37 endpoints)
 
 ```
-公开:
-  GET  /health               健康检查
-  GET  /health/live          存活探针
-  GET  /health/ready         就绪探针
-  GET  /metrics              Prometheus 指标
-  GET  /                     管理 UI
-  POST /api/v1/auth/login    登录
-  POST /api/v1/auth/logout   登出
+Public:
+  GET  /health                    Health check
+  GET  /health/live               Liveness probe
+  GET  /health/ready              Readiness probe
+  GET  /metrics                   Prometheus metrics
+  POST /api/v1/auth/login         Login (returns Bearer token)
+  POST /api/v1/auth/logout        Logout
 
-受保护 (Bearer Token):
-  GET  /api/v1/auth/me               当前用户
-  POST /api/v1/datasource            创建数据源
-  GET  /api/v1/datasource/list       数据源列表
-  POST /api/v1/datasource/test       测试连接
-  DELETE /api/v1/datasource/:id      删除数据源
-  POST /api/v1/task                  创建同步任务
-  GET  /api/v1/task/list             任务列表
-  GET  /api/v1/task/:id              任务详情
-  POST /api/v1/task/:id/start        启动任务
-  POST /api/v1/task/:id/stop         停止任务
-  DELETE /api/v1/task/:id            删除任务
-  GET  /api/v1/monitor/overview      监控概览
-  GET  /api/v1/monitor/task/:id      任务指标
-  POST /api/v1/reconcile/run         手动对账
-  GET  /api/v1/reconcile/list        对账记录
-  GET  /api/v1/reconcile/:id         对账详情
-  GET  /api/v1/alarm/config          告警规则
-  POST /api/v1/alarm/config          创建规则
-  DELETE /api/v1/alarm/config/:id    删除规则
-  POST /api/v1/alarm/test            测试告警
-  GET  /api/v1/audit/list            审计日志
-  GET  /api/v1/user                  用户列表
-  POST /api/v1/user                  创建用户
-  GET  /api/v1/role                  角色列表
+Protected (Bearer token):
+  GET  /api/v1/auth/me                     Current user
+  GET  /api/v1/user                        List users
+  POST /api/v1/user                        Create user
+  GET  /api/v1/role                        List roles
+  POST /api/v1/datasource                  Register source
+  POST /api/v1/datasource/test             Test connection
+  GET  /api/v1/datasource/list             List sources
+  DELETE /api/v1/datasource/:id            Delete source
+  POST /api/v1/task                        Create task (legacy API)
+  GET  /api/v1/task/list                   List tasks
+  GET  /api/v1/task/:id                    Task detail
+  POST /api/v1/task/:id/start              Start task
+  POST /api/v1/task/:id/stop               Stop task
+  DELETE /api/v1/task/:id                  Delete task
+  GET  /api/tasks                          List dynamic tasks
+  POST /api/tasks                          Create task (config JSON)
+  GET  /api/tasks/:id                      Task detail
+  PUT  /api/tasks/:id                      Update task (auto-reload)
+  DELETE /api/tasks/:id                    Delete task (stops if active)
+  POST /api/tasks/:id/reload               Force reload
+  GET  /api/v1/monitor/overview            Fleet overview
+  GET  /api/v1/monitor/task/:id            Per-task metrics
+  POST /api/v1/reconcile/run               Trigger reconciliation
+  GET  /api/v1/reconcile/list              Reconciliation records
+  GET  /api/v1/reconcile/:id               Record detail
+  GET  /api/v1/reconcile/:id/export        Export diff as CSV
+  GET  /api/v1/alarm/config                List alarm rules
+  POST /api/v1/alarm/config                Create alarm rule
+  DELETE /api/v1/alarm/config/:id          Delete alarm rule
+  POST /api/v1/alarm/test                  Send test alert
+  GET  /api/v1/audit/list                  Audit log
 ```
 
-## E2E 测试
+The admin UI is served at `/` and `/admin/*`.
+
+## E2E Walkthrough
 
 ```bash
-# 建测试库
+# 1. Create databases (source holds your business tables, sink is created by zetl)
 mysql -u root -e "CREATE DATABASE IF NOT EXISTS zetl_source; CREATE DATABASE IF NOT EXISTS zetl_sink;"
-mysql -u root zetl_source < schema_source.sql
-mysql -u root zetl_sink < schema.sql
 
-# 启动 zetl
-./zig-out/bin/zetl &
+# 2. Start zetl with the E2E config
+./zig-out/bin/zetl
 
-# 注册数据源 + 创建任务 + 启动
+# 3. Log in and grab a token
 TOKEN=$(curl -sS -X POST -d '{"username":"admin","password":"admin123"}' \
   http://127.0.0.1:18080/api/v1/auth/login | jq -r '.data.token')
-curl -X POST -H "Authorization: Bearer $TOKEN" -d '{"mall_id":"mall_001",...}' \
-  http://127.0.0.1:18080/api/v1/datasource
-curl -X POST -H "Authorization: Bearer $TOKEN" -d '{"task_name":"订单同步",...}' \
-  http://127.0.0.1:18080/api/v1/task
-curl -X POST -H "Authorization: Bearer $TOKEN" \
-  http://127.0.0.1:18080/api/v1/task/1/start
 
-# 验证
+# 4. Register a source, create a task, start it
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -d '{"mall_id":"mall_001","host":"127.0.0.1","port":3306,"db_name":"zetl_source","username":"root","password":""}' \
+  http://127.0.0.1:18080/api/v1/datasource
+
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -d '{"task_name":"orders","source_table":"t_order","target_table":"t_order","sync_mode":"both"}' \
+  http://127.0.0.1:18080/api/v1/task
+
+curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/task/1/start
+
+# 5. Verify
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/monitor/overview
 ```
 
-## 项目结构
+## Testing
+
+243 unit tests across transform (69), CDC (47), auth (25), engine (22), reconcile (19), alarm (15), web (15), sink (14), meta (8) and others — green on both SQLite and MySQL builds.
+
+## Project Structure
 
 ```
 src/
-├── main.zig                入口
-├── config.zig              TOML 配置解析
-├── common/                 日志/加密/告警
-├── meta/                   元数据 (SQLite)
-│   ├── store.zig           建表
-│   ├── datasource.zig      数据源 CRUD
-│   ├── task.zig            任务 CRUD
-│   ├── position.zig        位点管理
-│   └── metrics.zig         运行时指标
-├── cdc/                    采集器
-│   ├── event.zig           RowEvent
-│   └── poller.zig          伪 CDC 轮询
-├── transform/              转换
-│   ├── mapper.zig          字段映射
-│   ├── commission.zig      佣金计算
-│   └── engine.zig          流水线
-├── sink/
-│   └── mysql_sink.zig      幂等批量写入
-├── engine/
-│   ├── runtime.zig         任务运行时
-│   └── scheduler.zig       多任务调度
-├── web/                    Web 层
-│   ├── routes.zig          路由注册
-│   ├── deps.zig            全局依赖
-│   ├── auth_middleware.zig 鉴权中间件
-│   ├── response.zig        统一响应
-│   └── handler/            各模块 handler
-├── reconcile/              V2.0 对账
-├── alarm/                  V2.1 告警
-├── metrics/                Prometheus
-├── audit/                  V2.2 审计
-├── auth/                   V2.2 鉴权升级
+├── main.zig                Entry point
+├── config.zig              TOML config parsing
+├── common/                 Logging, crypto
+├── meta/                   Metadata store (SQLite): datasources, tasks, positions, metrics
+│   └── task/               V1 sync_task model + V5 tasks_config (config/service)
+├── cdc/                    Ingestion: poller (pseudo-CDC), binlog reader + parser + decoder
+├── transform/              Mapper, naming rules, commission, pipeline engine
+├── sink/                   Idempotent batched MySQL writer, auto DDL
+├── engine/                 Task runtime, multi-task scheduler
+├── web/                    HTTP layer
+│   ├── routes.zig          All route registrations
+│   ├── deps.zig            Global dependencies
+│   ├── auth_middleware.zig Auth + permission interceptors
+│   ├── response.zig        Unified response envelope
+│   └── handler/            ALL HTTP handlers (auth, datasource, task, tasks, monitor, alarm, audit, reconcile)
+├── reconcile/              Reconciliation services: summary, cron scheduler
+├── alarm/                  Alert rules, triggers, webhooks
+├── metrics/                Prometheus exporter
+├── audit/                  Audit trail service
+├── auth/                   Users, roles, RBAC, bcrypt
 └── assets/
-    └── index.html          管理 UI
+    └── index.html          Admin UI (embedded)
 ```
 
-## 依赖
+## Dependencies
 
-- [zfinal](https://github.com/zfinal-org/zfinal) v0.10.4 — Web 框架, DB 驱动, Token 管理
-- Zig 0.17 — 编译器和标准库
-- MySQL 8.x — 归集库 (需要 libmysqlclient)
-- SQLite 3 — 元数据库 (系统自带)
+- [zfinal](https://github.com/chy3xyz/zfinal) v0.27.0 — web framework, DB drivers, token management (pinned via git+https in `build.zig.zon`; pulls in zent v0.31.0 transitively)
+- Zig 0.17.0-dev.1970 — compiler and standard library (required by zfinal v0.26.1+)
+- MySQL 8.x — sink database (libmysqlclient)
+- SQLite 3 — metadata store (system library)
 
-## 许可
+## License
 
 MIT

@@ -2,6 +2,25 @@
 
 ## 日志
 
+### 2026-09-17 (2): 源码结构整理
+- **HTTP handler 统一收口到 `web/handler/`**: `web/api/tasks.zig` → `handler/tasks.zig`;
+  domain 模块的 4 个 handler 移入 (`alarm/audit/reconcile/handler.zig` → `web/handler/`),
+  `auth/handler.zig` (V2.2) 合并进 `web/handler/auth.zig` (V1), `loginV2` 更名 `login`.
+  规则从此单一: **domain 模块只放业务逻辑, HTTP 全在 web/handler/**.
+- **消除 `meta/task.zig` + `meta/task/` 文件/目录同名共存** → `meta/task/mod.zig`
+  (V1 sync_task model + re-export V5 config/service).
+- **删除死代码**: `common/alarm.zig` (V1 占位 stub, 无路由无测试);
+  `web/handler/auth.zig` 的 V1 静态 `login` (未路由, login fallback 分支完全覆盖其逻辑).
+- 移动均用 `git mv` 保留历史; 删除空 `test/` 目录.
+- 纯移动/改名/删死码, 无行为变更; SQLite + MySQL 双构建 243/243 测试通过.
+
+### 2026-09-17
+- zfinal v0.25.0 → v0.27.0, 依赖从本地 path 切换为 `build.zig.zon` git+https 固定 tag + commit + hash
+- Zig 0.17.0-dev.1567 → 0.17.0-dev.1970 (zfinal v0.26.1+ 要求 1970: `io.operate(.net_write)` 取代被移除的 `Io.VTable.netWrite`)
+- zetl 源码零改动通过 (v0.27 的 `DB.affectedRows` 改 `!i64`, zetl 无调用点; 1970 `@hasDecl` 可见性感知只影响 `renderPage` 用户, zetl 未用)
+- 升级流程沉淀: `zig fetch "git+https://...?ref=<tag>"` 取 hash (不要 `--save`, dev 编译器会把 git URL 写进 `.path`), 手工补 `.url`/`.hash`
+- SQLite + MySQL 双构建 243/243 测试通过
+
 ### 2026-06-15
 - 初始 V1 spec 完成 (PRD/imp/ard)
 - V1 设计文档 (2026-06-16-zetl-v1-design.md)
@@ -22,14 +41,15 @@
 2. **手写 Model/Service** — 不用 zfinal 生成器, 表结构固定
 3. **单二进制部署** — @embedFile 前端, 无外部文件依赖
 4. **伪 CDC** — V1/V2 用轮询 (主键分页 + update_time), 真 binlog 留 V3
-5. **主线程创建 Pool → 传入子线程** — zfinal v0.10.4 API 支持, 堆分配字符串
+5. **主线程创建 Pool → 传入子线程** — zfinal `*ConnectionPool` API, 堆分配字符串
 
 ## 依赖版本
 
 | 依赖 | 版本 |
 |------|------|
-| Zig | 0.17.0-dev.813 |
-| zfinal | 0.10.6 |
+| Zig | 0.17.0-dev.1970+67f39b551 (zigup; zfinal v0.26.1+ 最低要求) |
+| zfinal | 0.27.0 (git+https 固定 tag, 见 build.zig.zon) |
+| zent | 0.31.0 (经 zfinal 传递拉取) |
 | MySQL | 8.4 (macOS Homebrew) |
 | SQLite | 3 (系统自带) |
 
@@ -41,7 +61,7 @@
 
 ## 测试覆盖
 
-- 单元测试: 32 个
+- 单元测试: 243 个 (transform 69 / cdc 47 / auth 25 / engine 22 / reconcile 19 / web 15 / alarm 15 / sink 14 / meta 8 / audit 3 / main 2 / config 2 / common 2)
 - SQLite 构建: ✅
 - MySQL 构建: ✅
 - E2E (全量同步): ✅
@@ -53,7 +73,7 @@
 - 增量同步: 2 行/1s 轮询周期
 - API 延迟: < 5ms (本地回环), start task ~20ms
 - 内存: ~8MB (空闲), ~20MB (4 任务运行)
-- 二进制: 3.8MB
+- 二进制: 3.8MB (zfinal v0.27 时代 ReleaseSafe ≈ 4.8MB, Debug ≈ 10MB)
 
 ## 已知限制
 

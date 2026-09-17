@@ -3,9 +3,9 @@
 
 const std = @import("std");
 const zfinal = @import("zfinal");
-const meta = @import("../meta/mod.zig");
-const web_deps = @import("../web/deps.zig");
-const response = @import("../web/response.zig");
+const meta = @import("../../meta/mod.zig");
+const web_deps = @import("../deps.zig");
+const response = @import("../response.zig");
 
 /// GET /api/v1/audit/list
 pub fn list(ctx: *zfinal.Context) !void {

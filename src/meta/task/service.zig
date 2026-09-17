@@ -8,7 +8,7 @@
 //!   - `delete`     按 ID 删除
 //!   - `setStatus`  按 ID 更新 status 字段
 //!
-//! SQL 模式与列绑定 API 与 `src/meta/task.zig` 中的 `SyncTask.Service` 完全一致:
+//! SQL 模式与列绑定 API 与 `src/meta/task/mod.zig` 中的 V1 `SyncTask.Service` 完全一致:
 //!   - `store.db.execParams(sql, &params)`
 //!   - `store.db.query / queryParams(sql, &params)`
 //!   - `store.db.lastInsertId()`
