@@ -56,27 +56,6 @@ pub const MetaStore = struct {
             \\)
         );
 
-        // 同步任务
-        try self.db.exec(
-            \\CREATE TABLE IF NOT EXISTS sync_task (
-            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
-            \\  task_name TEXT NOT NULL,
-            \\  datasource_id INTEGER NOT NULL,
-            \\  source_table TEXT NOT NULL,
-            \\  target_table TEXT NOT NULL,
-            \\  sync_mode TEXT NOT NULL DEFAULT 'cdc',
-            \\  field_mappings TEXT,
-            \\  filter_condition TEXT,
-            \\  batch_size INTEGER NOT NULL DEFAULT 1000,
-            \\  enable_commission_calc INTEGER NOT NULL DEFAULT 0,
-            \\  status INTEGER NOT NULL DEFAULT 0,
-            \\  last_run_time TEXT,
-            \\  last_error TEXT,
-            \\  created_at TEXT DEFAULT (datetime('now')),
-            \\  FOREIGN KEY (datasource_id) REFERENCES datasource(id)
-            \\)
-        );
-
         // 位点 (伪 CDC: last_pk 全量游标 + last_update_time 增量游标; binlog CDC: binlog_file + binlog_pos)
         try self.db.exec(
             \\CREATE TABLE IF NOT EXISTS sync_position (
@@ -88,7 +67,7 @@ pub const MetaStore = struct {
             \\  updated_at TEXT DEFAULT (datetime('now')),
             \\  binlog_file TEXT NOT NULL DEFAULT '',
             \\  binlog_pos INTEGER NOT NULL DEFAULT 0,
-            \\  FOREIGN KEY (task_id) REFERENCES sync_task(id)
+            \\  FOREIGN KEY (task_id) REFERENCES tasks_config(id)
             \\)
         );
         try self.migrateSyncPosition();
@@ -102,7 +81,7 @@ pub const MetaStore = struct {
             \\  fail_count INTEGER NOT NULL DEFAULT 0,
             \\  last_error TEXT,
             \\  updated_at TEXT DEFAULT (datetime('now')),
-            \\  FOREIGN KEY (task_id) REFERENCES sync_task(id)
+            \\  FOREIGN KEY (task_id) REFERENCES tasks_config(id)
             \\)
         );
 

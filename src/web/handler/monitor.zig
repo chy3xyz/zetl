@@ -32,7 +32,11 @@ pub fn taskMetrics(ctx: *zfinal.Context) !void {
     const id = try std.fmt.parseInt(i64, id_str, 10);
 
     const m = try meta.metrics.Service.load(deps.store_ptr, id);
-    const t = (try meta.task.Service.findById(deps.store_ptr, allocator, id)) orelse {
+    var svc = meta.task.service.Service{ .store = deps.store_ptr };
+    const t = (svc.getById(id) catch {
+        try response.fail(ctx, .system_error, "查询失败");
+        return;
+    }) orelse {
         try response.fail(ctx, .business_error, "任务不存在");
         return;
     };
@@ -48,9 +52,9 @@ pub fn taskMetrics(ctx: *zfinal.Context) !void {
 
     try response.ok(ctx, .{
         .task_id = id,
-        .task_name = t.task_name,
-        .status = t.status,
-        .last_error = t.last_error,
+        .task_name = t.name,
+        .status = @intFromEnum(t.status),
+        .last_error = m.last_error,
         .position = .{
             .stage = pos.stage.toString(),
             .last_pk = pos.last_pk,

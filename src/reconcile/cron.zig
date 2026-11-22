@@ -263,8 +263,9 @@ fn sleepInterruptible(ctx: *CronContext, total_seconds: u64) void {
 
 fn runAllTasks(ctx: *CronContext) void {
     const allocator = ctx.allocator;
-    const tasks = meta.task.Service.findEnabled(ctx.store, allocator) catch |err| {
-        common.logger.err_("[cron] findEnabled err: {s}", .{@errorName(err)});
+    var svc = meta.task.service.Service{ .store = ctx.store };
+    const tasks = svc.list(.active) catch |err| {
+        common.logger.err_("[cron] list active tasks err: {s}", .{@errorName(err)});
         return;
     };
     defer {
@@ -273,10 +274,10 @@ fn runAllTasks(ctx: *CronContext) void {
     }
     common.logger.inf("[cron] tick, {d} 个启用任务", .{tasks.len});
     for (tasks) |t| {
-        runOneTask(ctx, t.id, t.task_name, t.target_table) catch |err| {
+        runOneTask(ctx, t.id) catch |err| {
             common.logger.err_("[cron] task {d} ({s}) err: {s}", .{
                 t.id,
-                t.task_name,
+                t.name,
                 @errorName(err),
             });
         };
@@ -286,24 +287,27 @@ fn runAllTasks(ctx: *CronContext) void {
 fn runOneTask(
     ctx: *CronContext,
     task_id: i64,
-    task_name: []const u8,
-    target_table: []const u8,
 ) !void {
     const allocator = ctx.allocator;
 
-    // 1. 加载 task
-    const task_opt = try meta.task.Service.findById(ctx.store, allocator, task_id);
-    const task = task_opt orelse {
+    // 1. 加载 V5 TaskConfig (收敛后唯一任务系统)
+    var svc = meta.task.service.Service{ .store = ctx.store };
+    const task_opt = svc.getById(task_id) catch return error.TaskNotFound;
+    const t = task_opt orelse {
         common.logger.warn("[cron] task {d} 不存在, 跳过", .{task_id});
         return error.TaskNotFound;
     };
-    var t = task;
-    defer t.deinit(allocator);
+    defer {
+        var tt = t;
+        tt.deinit(allocator);
+    }
+    const task_name = t.name;
+    const target_table = t.target_table;
 
-    // 2. 加载 datasource
-    const ds_opt = try meta.datasource.Service.findById(ctx.store, allocator, t.datasource_id);
+    // 2. 加载 datasource (V5 按 source_db = mall_id 关联)
+    const ds_opt = try meta.datasource.Service.findByMallId(ctx.store, allocator, t.source_db);
     const ds = ds_opt orelse {
-        common.logger.warn("[cron] task {d} 数据源不存在, 跳过", .{task_id});
+        common.logger.warn("[cron] task {d} 数据源不存在 (source_db={s}), 跳过", .{ task_id, t.source_db });
         return error.DatasourceNotFound;
     };
     var d = ds;
@@ -374,13 +378,7 @@ fn runOneTask(
 /// 手动触发对账 (供测试 / API 使用)
 /// task_id 必须是 status=1 的任务
 pub fn runNow(ctx: *CronContext, task_id: i64) !void {
-    const allocator = ctx.allocator;
-    const task_opt = try meta.task.Service.findById(ctx.store, allocator, task_id);
-    const task = task_opt orelse return error.TaskNotFound;
-    var t = task;
-    defer t.deinit(allocator);
-
-    return runOneTask(ctx, t.id, t.task_name, t.target_table);
+    return runOneTask(ctx, task_id);
 }
 
 fn currentTimestamp() i64 {

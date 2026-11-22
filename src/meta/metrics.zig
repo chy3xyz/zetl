@@ -62,14 +62,15 @@ pub const Service = struct {
         try store.db.execParams(sql, &.{ .{ .int = task_id }, .{ .int = delta } });
     }
 
-    /// 监控大盘全局
+    /// 监控大盘全局 (V5 收敛: 任务统计读 tasks_config; legacy sync_task 已移除)
+    /// running = active 任务数; error = runtime_metrics 中 fail_count>0 的任务数.
     pub fn globalOverview(store: *store_mod.MetaStore) !OverviewSnapshot {
         const sql: [:0]const u8 = "SELECT " ++
-            "(SELECT COUNT(*) FROM sync_task WHERE status = 1) AS running, " ++
-            "(SELECT COUNT(*) FROM sync_task WHERE status = 2) AS err, " ++
+            "(SELECT COUNT(*) FROM tasks_config WHERE status = 1) AS running, " ++
+            "(SELECT COUNT(*) FROM runtime_metrics WHERE fail_count > 0) AS err, " ++
             "(SELECT COALESCE(SUM(today_rows), 0) FROM runtime_metrics) AS today_rows, " ++
             "(SELECT COUNT(*) FROM datasource WHERE status = 1) AS ds_count, " ++
-            "(SELECT COUNT(*) FROM sync_task) AS task_count";
+            "(SELECT COUNT(*) FROM tasks_config) AS task_count";
         var result = try store.db.query(sql);
         defer result.deinit();
         if (result.next()) {

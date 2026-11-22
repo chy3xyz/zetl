@@ -151,15 +151,15 @@ test "isPublicPath" {
     try std.testing.expect(isPublicPath("/"));
     try std.testing.expect(isPublicPath("/admin/datasource"));
     try std.testing.expect(!isPublicPath("/api/v1/datasource/list"));
-    try std.testing.expect(!isPublicPath("/api/v1/task/list"));
+    try std.testing.expect(!isPublicPath("/api/tasks"));
+    try std.testing.expect(!isPublicPath("/api/tasks/1/reload"));
 }
 
 test "isPublicPath returns false for /api/tasks endpoints" {
     try std.testing.expect(!isPublicPath("/api/tasks"));
     try std.testing.expect(!isPublicPath("/api/tasks/1"));
     try std.testing.expect(!isPublicPath("/api/tasks/1/reload"));
-    try std.testing.expect(!isPublicPath("/api/v1/task"));
-    try std.testing.expect(!isPublicPath("/api/v1/task/1/start"));
+        try std.testing.expect(!isPublicPath("/api/tasks/1/stop"));
 }
 
 test "isPublicPath returns true for known public paths" {

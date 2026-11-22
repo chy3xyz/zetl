@@ -246,6 +246,7 @@ pub fn update(ctx: *zfinal.Context) !void {
         return;
     };
 
+    // status=disabled → reloadTask 内部停用 (stop + 不启动); active → 重载启动.
     deps.scheduler_ptr.reloadTask(id) catch |err| {
         try response.ok(ctx, .{
             .id = id,
@@ -255,7 +256,20 @@ pub fn update(ctx: *zfinal.Context) !void {
         return;
     };
 
-    try response.ok(ctx, .{ .id = id, .status = "reloaded" });
+    try response.ok(ctx, .{ .id = id, .status = if (cfg.status == .disabled) "disabled" else "reloaded" });
+}
+
+/// POST /api/tasks/{id}/stop — 停止运行实例, DB 配置保留 (可 reload 重新启动).
+pub fn stop(ctx: *zfinal.Context) !void {
+    const id = parseIdParam(ctx) catch {
+        try response.fail(ctx, .param_error, "id 必填且必须是整数");
+        return;
+    };
+    deps.scheduler_ptr.stopTaskById(id) catch |err| {
+        try response.fail(ctx, .system_error, @errorName(err));
+        return;
+    };
+    try response.ok(ctx, .{ .id = id, .status = "stopped" });
 }
 
 /// DELETE /api/tasks/{id}

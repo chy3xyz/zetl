@@ -10,7 +10,6 @@ const deps = @import("deps.zig");
 const auth_mw = @import("auth_middleware.zig");
 const auth = @import("handler/auth.zig");
 const datasource = @import("handler/datasource.zig");
-const task = @import("handler/task.zig");
 const monitor = @import("handler/monitor.zig");
 const tasks_api = @import("handler/tasks.zig");
 
@@ -52,11 +51,6 @@ pub fn registerAll(
     const datasource_read_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("datasource:read") };
     const datasource_write_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("datasource:write") };
     const datasource_delete_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("datasource:write") };
-    const task_read_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("task:read") };
-    const task_write_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("task:write") };
-    const task_start_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("task:write") };
-    const task_stop_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("task:write") };
-    const task_delete_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("task:write") };
     const reconcile_read_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("reconcile:read") };
     const reconcile_run_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("reconcile:run") };
     const alarm_read_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("alarm:read") };
@@ -78,15 +72,7 @@ pub fn registerAll(
     try app.deleteWithInterceptors("/api/v1/datasource/:id", datasource.delete, &datasource_delete_intc);
 
     // 任务
-    try app.postWithInterceptors("/api/v1/task", task.create, &task_write_intc);
-    try app.getWithInterceptors("/api/v1/task/list", task.list, &task_read_intc);
-    try app.getWithInterceptors("/api/v1/task/:id", task.detail, &task_read_intc);
-    try app.postWithInterceptors("/api/v1/task/:id/start", task.start, &task_start_intc);
-    try app.postWithInterceptors("/api/v1/task/:id/stop", task.stop, &task_stop_intc);
-    try app.deleteWithInterceptors("/api/v1/task/:id", task.delete, &task_delete_intc);
-
-    // V5 Phase 5 Task 5: 动态任务管理 /api/tasks (DB + Scheduler 联动)
-    // P1 任务 2: 全量加 auth + RBAC, 与 V1 /api/v1/task 对齐权限模型
+    // V5 任务管理 /api/tasks — 唯一任务系统 (2026-11-21 收敛, legacy /api/v1/task 已移除)
     const v5_task_read_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("task:read") };
     const v5_task_write_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("task:write") };
     const v5_task_delete_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("task:delete") };
@@ -97,6 +83,7 @@ pub fn registerAll(
     try app.putWithInterceptors("/api/tasks/:id", tasks_api.update, &v5_task_write_intc);
     try app.deleteWithInterceptors("/api/tasks/:id", tasks_api.delete, &v5_task_delete_intc);
     try app.postWithInterceptors("/api/tasks/:id/reload", tasks_api.reload, &v5_task_start_intc);
+    try app.postWithInterceptors("/api/tasks/:id/stop", tasks_api.stop, &v5_task_start_intc);
 
     // 监控
     const monitor_read_intc = [_]zfinal.Interceptor{ auth_mw.authInterceptor(), auth_mw.permissionInterceptor("monitor:read") };

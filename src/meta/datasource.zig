@@ -138,9 +138,9 @@ pub const Service = struct {
         try store.db.execParams(sql, &.{.{ .int = id }});
     }
 
-    /// 检查数据源是否被任务绑定
+    /// 检查数据源是否被任务绑定 (V5: tasks_config.source_db = datasource.mall_id)
     pub fn hasTaskBinding(store: *store_mod.MetaStore, id: i64) !bool {
-        const sql: [:0]const u8 = "SELECT COUNT(*) FROM sync_task WHERE datasource_id = $1";
+        const sql: [:0]const u8 = "SELECT COUNT(*) FROM tasks_config WHERE source_db = (SELECT mall_id FROM datasource WHERE id = $1)";
         var result = try store.db.queryParams(sql, &.{.{ .int = id }});
         defer result.deinit();
         if (result.next()) {

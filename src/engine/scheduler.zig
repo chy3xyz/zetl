@@ -5,7 +5,140 @@ const std = @import("std");
 const zfinal = @import("zfinal");
 const meta = @import("../meta/mod.zig");
 const runtime = @import("runtime.zig");
+const transform = @import("../transform/mod.zig");
 const common = @import("../common/mod.zig");
+
+/// V5 config_json 覆盖项 (Phase 6 TODO 落地: config_json → RuntimeConfig 透传).
+/// 支持的键 (root 级):
+///   batch_size (int) / field_mappings (string|object|array) /
+///   filter: {field, op, value} / enable_commission_calc (bool) /
+///   transform: {naming_rule(s), mask_phone/email/id_card/all, case_insensitive_fields}
+///     (transform 段词汇表与 Phase 6b/6c/10/11 的 TransformConfig.initFromJson 完全一致)
+pub const V5Overrides = struct {
+    batch_size: u32 = 1000,
+    field_mappings_json: ?[]const u8 = null,
+    filter_field: ?[]const u8 = null,
+    filter_op: transform.engine.FilterOp = .gte,
+    filter_value: ?[]const u8 = null,
+    enable_commission_calc: bool = false,
+    /// naming_rules + mask 开关 (initFromJson 产物). 堆内 naming_rules 归此结构,
+    /// deinit(allocator) 释放; 默认值全静态, deinit 安全.
+    transform: transform.engine.TransformConfig = .{ .mall_id = "" },
+};
+
+/// parseV5Overrides 的返回: ov 中字符串切片借用自 json arena,
+/// TransformEngine 在 SyncTask.init 内 dupe 所有输入, 因此 arena 存活到 init 返回即可.
+pub const V5ParsedOverrides = struct {
+    json: ?std.json.Parsed(std.json.Value) = null,
+    ov: V5Overrides = .{},
+
+    pub fn deinit(self: *V5ParsedOverrides, a: std.mem.Allocator) void {
+        self.ov.transform.deinit(a);
+        if (self.json) |*p| p.deinit();
+    }
+};
+
+/// 解析 V5 config_json 为 RuntimeConfig 覆盖项. 不抛错: 任何解析失败都
+/// warn + 对应键回退默认值 (与 commission 优雅降级哲学一致).
+pub fn parseV5Overrides(a: std.mem.Allocator, config_json: []const u8) V5ParsedOverrides {
+    var out = V5ParsedOverrides{};
+    const parsed = std.json.parseFromSlice(std.json.Value, a, config_json, .{}) catch |err| {
+        common.logger.warn("config_json 解析失败 ({s}), 使用默认配置", .{@errorName(err)});
+        return out;
+    };
+    out.json = parsed;
+    if (parsed.value != .object) return out;
+    const root = parsed.value.object;
+
+    if (root.get("batch_size")) |v| {
+        if (v == .integer and v.integer > 0 and v.integer <= 100_000) {
+            out.ov.batch_size = @intCast(v.integer);
+        } else {
+            common.logger.warn("config_json.batch_size 非法, 使用默认 1000", .{});
+        }
+    }
+
+    // field_mappings: 字符串原样借用; 对象/数组序列化回 JSON 文本 (mapper 消费 JSON 字符串)
+    if (root.get("field_mappings")) |v| {
+        switch (v) {
+            .string => |sv| out.ov.field_mappings_json = sv,
+            .object, .array => {
+                out.ov.field_mappings_json = std.fmt.allocPrint(
+                    parsed.arena.allocator(),
+                    "{f}",
+                    .{std.json.Formatter(@TypeOf(v)){ .value = v, .options = .{} }},
+                ) catch null;
+            },
+            else => common.logger.warn("config_json.field_mappings 类型不支持, 忽略", .{}),
+        }
+    }
+
+    // filter: engine 的生效过滤路径 (filter_field + 数值比较), 取代被 engine 弃用的 filter_condition
+    if (root.get("filter")) |v| {
+        if (v == .object) {
+            if (v.object.get("field")) |f| {
+                if (f == .string and f.string.len > 0) out.ov.filter_field = f.string;
+            }
+            if (v.object.get("op")) |o| {
+                if (o == .string) {
+                    out.ov.filter_op = std.meta.stringToEnum(transform.engine.FilterOp, o.string) orelse .gte;
+                }
+            }
+            if (v.object.get("value")) |val| {
+                switch (val) {
+                    .string => |sv| out.ov.filter_value = sv,
+                    .integer => |iv| {
+                        out.ov.filter_value = std.fmt.allocPrint(parsed.arena.allocator(), "{d}", .{iv}) catch null;
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
+    if (root.get("enable_commission_calc")) |v| {
+        if (v == .bool) out.ov.enable_commission_calc = v.bool;
+    }
+
+    // transform.* → naming_rules + mask 开关
+    out.ov.transform = transform.engine.TransformConfig.initFromJson(a, parsed.value) catch |err| blk: {
+        common.logger.warn("config_json.transform 解析失败 ({s}), 忽略 transform 段", .{@errorName(err)});
+        break :blk .{ .mall_id = "" };
+    };
+
+    return out;
+}
+
+/// TaskConfig (V5 行) + 数据源 + 覆盖项 → RuntimeConfig.
+fn v5RuntimeConfig(cfg: meta.task.config.TaskConfig, ds: meta.datasource.Datasource, ov: *const V5Overrides) runtime.RuntimeConfig {
+    // V5 sync_mode: 0=full / 1=poll / 2=binlog / 3=both (与 TaskActiveStatus 枚举对齐).
+    const sync_mode: meta.task.SyncMode = switch (cfg.sync_mode) {
+        0 => .full,
+        1 => .poll,
+        2 => .binlog,
+        3 => .both,
+        else => .poll,
+    };
+    return .{
+        .task_id = cfg.id,
+        .source_table = cfg.source_table,
+        .target_table = cfg.target_table,
+        .batch_size = ov.batch_size,
+        .sync_mode = sync_mode,
+        .field_mappings_json = ov.field_mappings_json,
+        .filter_field = ov.filter_field,
+        .filter_op = ov.filter_op,
+        .filter_value = ov.filter_value,
+        .enable_commission_calc = ov.enable_commission_calc,
+        .naming_rules = ov.transform.naming_rules,
+        .mask_phone = ov.transform.mask_phone,
+        .mask_email = ov.transform.mask_email,
+        .mask_id_card = ov.transform.mask_id_card,
+        .mask_all = ov.transform.mask_all,
+        .case_insensitive_fields = ov.transform.case_insensitive_fields,
+        .mall_id = ds.mall_id,
+    };
+}
 
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
@@ -66,141 +199,40 @@ pub const Scheduler = struct {
     }
 
     /// 启动一个任务 (从 task_id 加载配置)
-    pub fn startTask(self: *Scheduler, task_id: i64) !void {
-        const t0 = Scheduler.nowMs();
-        // P1 任务 1.8: 优雅停机检查 - 收到停机信号后拒绝任何新 task 启动.
-        // 双重检查: 快路径 (无锁) + 锁内精确检查.
-        if (self.is_shutting_down.load(.acquire)) {
-            common.logger.warn("任务 {d} 启动被拒绝: 正在停机", .{task_id});
-            return error.ShutdownInProgress;
-        }
-
-        const io = zfinal.io_instance.io;
-        self.mutex.lock(io) catch return error.LockFailed;
-        defer self.mutex.unlock(io);
-
-        // 锁内再检查一次 (防止刚进入临界区时 stopAll 置位 flag)
-        if (self.is_shutting_down.load(.acquire)) {
-            return error.ShutdownInProgress;
-        }
-
-        if (self.tasks.contains(task_id)) {
-            common.logger.warn("任务 {d} 已在运行, 跳过启动", .{task_id});
-            return;
-        }
-
-        // 1. 加载 task 配置
-        const task = (try meta.task.Service.findById(self.store, self.allocator, task_id)) orelse {
-            common.logger.err_("任务 {d} 不存在", .{task_id});
-            return error.TaskNotFound;
-        };
-        defer {
-            var t = task;
-            t.deinit(self.allocator);
-        }
-        const t1 = Scheduler.nowMs();
-
-        // 2. 加载 datasource
-        const ds = (try meta.datasource.Service.findById(self.store, self.allocator, task.datasource_id)) orelse {
-            common.logger.err_("任务 {d} 绑定的数据源 {d} 不存在", .{ task_id, task.datasource_id });
-            return error.DatasourceNotFound;
-        };
-        defer {
-            var d = ds;
-            d.deinit(self.allocator);
-        }
-        const t2 = Scheduler.nowMs();
-
-        // 3. 构造 SyncTask
-        // 旧 sync_mode='cdc' 视作增量轮询 (.poll) — 老 CDC 实现本质就是按 update_time 轮询
-        const sync_mode = blk: {
-            const raw = task.sync_mode;
-            if (std.mem.eql(u8, raw, "cdc")) break :blk .poll;
-            break :blk std.meta.stringToEnum(meta.task.SyncMode, raw) orelse .poll;
-        };
-        const rcfg = runtime.RuntimeConfig{
-            .task_id = task.id,
-            .source_table = task.source_table,
-            .target_table = task.target_table,
-            .batch_size = @intCast(task.batch_size),
-            .sync_mode = sync_mode,
-            .field_mappings_json = task.field_mappings,
-            .filter_condition = task.filter_condition,
-            .enable_commission_calc = task.enable_commission_calc == 1,
-            .mall_id = ds.mall_id,
-        };
-        // 在主线程创建源库连接池 + dupe字符串 (确保任务线程不会读到栈回收后的垃圾)
+    /// 构建 src_pool + 堆分配字符串 + 实例化 SyncTask (V1/V5 公共).
+    /// 返回的 *SyncTask 归 caller; 失败时字符串/池/struct 内部全部回收 —
+    /// 修复了原路径 "SyncTask.init 失败泄漏 src_pool + 字符串" 的限制.
+    fn buildSyncTask(
+        self: *Scheduler,
+        rcfg: runtime.RuntimeConfig,
+        ds: meta.datasource.Datasource,
+    ) !*runtime.SyncTask {
         const src_host = try self.allocator.dupe(u8, ds.host);
+        errdefer self.allocator.free(src_host);
         const src_db = try self.allocator.dupe(u8, ds.db_name);
+        errdefer self.allocator.free(src_db);
         const src_user = try self.allocator.dupe(u8, ds.username);
+        errdefer self.allocator.free(src_user);
         const src_pass = try self.allocator.dupe(u8, ds.password);
-        const src_cfg = zfinal.DBConfig{ .db_type = .mysql, .host = src_host, .port = ds.port, .database = src_db, .username = src_user, .password = src_pass };
-        const t3 = Scheduler.nowMs();
+        errdefer self.allocator.free(src_pass);
+        const src_cfg = zfinal.DBConfig{
+            .db_type = .mysql,
+            .host = src_host,
+            .port = ds.port,
+            .database = src_db,
+            .username = src_user,
+            .password = src_pass,
+        };
         const src_pool = try zfinal.ConnectionPool.init(self.allocator, src_cfg, 1);
-        const t4 = Scheduler.nowMs();
-        const task_ptr = try self.allocator.create(runtime.SyncTask);
-        errdefer self.allocator.destroy(task_ptr);
-        task_ptr.* = try runtime.SyncTask.init(self.allocator, rcfg, ds, self.store, self.sink_pool, src_pool, src_host, src_db, src_user, src_pass);
-        const t5 = Scheduler.nowMs();
-
-        // 4. 启动线程
-        try task_ptr.start();
-        const t6 = Scheduler.nowMs();
-        try self.tasks.put(task_id, task_ptr);
-
-        // 5. 更新 task 状态为运行中
-        try meta.task.Service.updateStatus(self.store, task_id, 1, null);
-        const t7 = Scheduler.nowMs();
-        common.logger.inf("任务 {d} ({s}) 启动成功 (总耗时 {d}ms, load_task={d}ms load_ds={d}ms dup={d}ms pool_init={d}ms sync_task_init={d}ms spawn={d}ms put+status={d}ms)", .{
-            task_id, task.task_name, t7 - t0, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t6 - t5, t7 - t6,
-        });
+        errdefer src_pool.deinit();
+        const t = try self.allocator.create(runtime.SyncTask);
+        errdefer self.allocator.destroy(t);
+        t.* = try runtime.SyncTask.init(self.allocator, rcfg, ds, self.store, self.sink_pool, src_pool, src_host, src_db, src_user, src_pass);
+        return t;
     }
 
-    /// 停止一个任务
-    pub fn stopTask(self: *Scheduler, task_id: i64) !void {
-        const io = zfinal.io_instance.io;
-        self.mutex.lock(io) catch return error.LockFailed;
-        defer self.mutex.unlock(io);
 
-        if (self.tasks.fetchRemove(task_id)) |kv| {
-            const task_ptr = kv.value;
-            task_ptr.stop();
-            task_ptr.deinit();
-            self.allocator.destroy(task_ptr);
-            try meta.task.Service.updateStatus(self.store, task_id, 0, null);
-            common.logger.inf("任务 {d} 已停止", .{task_id});
-        } else {
-            common.logger.warn("任务 {d} 未在运行, 无需停止", .{task_id});
-        }
-    }
 
-    /// V5 Phase 5 Task 3: 动态添加任务 (从 `tasks_config` 表加载并启动).
-    ///
-    /// 行为 (按顺序, 严格 errdefer 链):
-    ///   1. 快路径停机检查 (无锁).
-    ///   2. 加载 V5 `TaskConfig` (与 V1 sync_task 表解耦).
-    ///   3. test_mode: 锁内插入 stub SyncTask, 不启动线程 (单测用).
-    ///   4. 生产模式 (锁外, 避免持锁做重活):
-    ///      a. 查找 datasource (mall_id = cfg.source_db)
-    ///      b. 构建 src_pool + 堆分配字符串 (由 SyncTask._sh/_sd/_su/_sp 持有寿命)
-    ///      c. 实例化 SyncTask (完整 init: transformer + sink + poller + binlog_db + pos)
-    ///   5. 加锁, 二次停机 + contains 检查.
-    ///   6. `tasks.put(id, task_ptr)` — 先注册到 map.
-    ///   7. `task_ptr.start()` — 后启动线程 (start 失败时由 cleanup_needed defer 释放).
-    ///   8. 解锁, 记录成功日志.
-    ///
-    /// 为什么 put 必须在 start 之前:
-    ///   - 旧实现 start → put, 若 put OOM 则 errdefer 仅 destroy, 但 start 已起的线程在
-    ///     持有 src_pool + _sh/_sd/_su/_sp 时被释放, worker 线程 deref 释放的内存 → UAF.
-    ///   - 新实现 put → start, 若 start 失败, cleanup_needed defer 触发 deinit (join 线程
-    ///     + 释放 src_pool + 字符串 + destroy), map 在 errdefer 链中由 fetchRemove 清掉.
-    ///     worker 线程从未来过 → 无 UAF 风险.
-    ///
-    /// 错误:
-    ///   - `error.TaskNotFound`         — V5 `tasks_config` 无此 id
-    ///   - `error.TaskAlreadyRunning`   — 已在 `tasks` map 中
-    ///   - `error.ShutdownInProgress`   — 正在停机
-    ///   - `error.DatasourceNotFound`   — `cfg.source_db` 在 `datasource` 表中无匹配行
     pub fn addTask(self: *Scheduler, task_id: i64) !void {
         // 1. 快路径停机检查 (无锁).
         if (self.is_shutting_down.load(.acquire)) {
@@ -275,50 +307,18 @@ pub const Scheduler = struct {
             d.deinit(self.allocator);
         }
 
-        // b. 构造 RuntimeConfig.
+        // b. 构造 RuntimeConfig — config_json 覆盖项透传 (Phase 6 TODO 落地):
+        //    batch_size / field_mappings / filter / enable_commission_calc / transform.*
+        //    字符串借用自 ovp arena, naming_rules 归 ovp; TransformEngine 在 SyncTask.init
+        //    内 dupe 所有输入, ovp 存活到 init 返回即可 (defer 在函数尾, 晚于 init).
         //    V5 sync_mode: 0=full / 1=poll / 2=binlog / 3=both (与 TaskActiveStatus 枚举对齐).
-        //    batch_size / enable_commission_calc 暂未从 config_json 解析, 用默认值.
-        //    TODO(Phase 6): 解析 config_json → 覆盖 RuntimeConfig.
-        const sync_mode: meta.task.SyncMode = switch (cfg.sync_mode) {
-            0 => .full,
-            1 => .poll,
-            2 => .binlog,
-            3 => .both,
-            else => .poll,
-        };
-        const rcfg = runtime.RuntimeConfig{
-            .task_id = cfg.id,
-            .source_table = cfg.source_table,
-            .target_table = cfg.target_table,
-            .batch_size = 1000,
-            .sync_mode = sync_mode,
-            .enable_commission_calc = false,
-            .mall_id = ds.mall_id,
-        };
+        var ovp = parseV5Overrides(self.allocator, cfg.config_json);
+        defer ovp.deinit(self.allocator);
+        const rcfg = v5RuntimeConfig(cfg, ds, &ovp.ov);
 
-        // c. 构建 src_pool + 堆分配字符串 (由 SyncTask._sh/_sd/_su/_sp 持有寿命).
-        const src_host = try self.allocator.dupe(u8, ds.host);
-        const src_db = try self.allocator.dupe(u8, ds.db_name);
-        const src_user = try self.allocator.dupe(u8, ds.username);
-        const src_pass = try self.allocator.dupe(u8, ds.password);
-        const src_cfg = zfinal.DBConfig{
-            .db_type = .mysql,
-            .host = src_host,
-            .port = ds.port,
-            .database = src_db,
-            .username = src_user,
-            .password = src_pass,
-        };
-        const src_pool = try zfinal.ConnectionPool.init(self.allocator, src_cfg, 1);
-
-        // d. 实例化 SyncTask (blk 作用域限制 errdefer, 避免后续 put→start 链上 double-destroy).
-        const task_ptr = blk: {
-            const t = try self.allocator.create(runtime.SyncTask);
-            errdefer self.allocator.destroy(t); // 仅在 blk 内有效 (init 失败时回收 struct 内存)
-            t.* = try runtime.SyncTask.init(self.allocator, rcfg, ds, self.store, self.sink_pool, src_pool, src_host, src_db, src_user, src_pass);
-            break :blk t;
-        };
-        // 注: SyncTask.init 失败时, src_pool + 字符串会泄漏 (V1 startTask 同款限制, 不在本次重构范围).
+        // c/d. 构建 src_pool + 堆字符串 + 实例化 SyncTask (buildSyncTask 公共函数;
+        //      init 失败时内部资源全部回收).
+        const task_ptr = try self.buildSyncTask(rcfg, ds);
 
         // 5. 加锁, 二次停机 + contains 检查 + put + start (顺序: put 必须先于 start).
         //    失败时由 cleanup_needed defer 统一 deinit + destroy, 避免 double-free.
@@ -369,6 +369,26 @@ pub const Scheduler = struct {
     ///   - `removeTask`: 停线程 + 删除 V5 `tasks_config` 行 (HTTP DELETE 流程见 design §4.3)
     ///
     /// 错误: 仅 DB DELETE 失败时返回 (`error.TaskNotFound` 不再出现 — DB 行被删即视为成功).
+    /// V5 stop 语义: 停止运行实例并从调度器移除, DB 配置保留 (status 不变).
+    /// 与 removeTask (DB+内存全删) / reloadTask 的 disabled 分支互补.
+    /// map 中无条目时视为已停止, 不报错.
+    pub fn stopTaskById(self: *Scheduler, task_id: i64) !void {
+        const io = zfinal.io_instance.io;
+        self.mutex.lock(io) catch return error.LockFailed;
+        const entry = self.tasks.fetchRemove(task_id) orelse {
+            self.mutex.unlock(io);
+            return; // 已停止 (或从未启动), 幂等成功
+        };
+        self.mutex.unlock(io);
+
+        if (!self.test_mode) {
+            entry.value.stop();
+            entry.value.deinit();
+        }
+        self.allocator.destroy(entry.value);
+        common.logger.inf("任务 {d} 已停止 (配置保留, 可 reload 重新启动)", .{task_id});
+    }
+
     pub fn removeTask(self: *Scheduler, task_id: i64) !void {
         // 1. 先删 DB 行; 失败立即返回, 内存状态不变.
         var svc = meta.task.service.Service{ .store = self.store };
@@ -434,6 +454,20 @@ pub const Scheduler = struct {
             cfg_owned.deinit(self.allocator);
         }
 
+        // 2b. status=disabled: 停掉运行实例 (如有) 并返回, 不启动 —
+        //     PUT /api/tasks/{id} status=0 时经由 reloadTask 实现"停用".
+        if (cfg.status == .disabled) {
+            if (self.tasks.fetchRemove(task_id)) |kv| {
+                if (!self.test_mode) kv.value.stop();
+                if (!self.test_mode) kv.value.deinit();
+                self.allocator.destroy(kv.value);
+                common.logger.inf("任务 {d} 已停用 (stop + 从调度器移除, 配置保留)", .{task_id});
+            } else {
+                common.logger.inf("任务 {d} 为 disabled 且无运行实例", .{task_id});
+            }
+            return;
+        }
+
         // 3. 加锁.
         //    Fix C1: `defer self.mutex.unlock(io);` 自动覆盖所有 return 路径
         //    (error + success), 取代之前在 success / 二次停机检查中手动 unlock 的反模式.
@@ -472,10 +506,10 @@ pub const Scheduler = struct {
         //    blk 作用域限制 errdefer: 仅在 create/init 失败时回收 struct 内存,
         //    不触碰 SyncTask 字段 (与 addTask 同款已知限制: init 失败时部分字段泄漏).
         const task_ptr = blk: {
-            const t = try self.allocator.create(runtime.SyncTask);
-            errdefer self.allocator.destroy(t);
             if (self.test_mode) {
                 // test_mode stub — 与 addTask 同款, 跳过 transformer/sink/poller 真实实例化.
+                const t = try self.allocator.create(runtime.SyncTask);
+                errdefer self.allocator.destroy(t);
                 t.* = runtime.SyncTask{
                     .allocator = self.allocator,
                     .cfg = .{
@@ -496,9 +530,11 @@ pub const Scheduler = struct {
                     ._sp = &[_]u8{},
                     .pos = .{ .task_id = cfg.id },
                 };
+                break :blk t;
             } else {
-                // 生产模式: 与 addTask 同步路径一致.
-                // (TODO Phase 6: 提取 buildSyncTask 公共函数, 消除重复.)
+                // 生产模式: 与 addTask 同步路径一致 (config_json 覆盖项透传 + buildSyncTask 公共函数).
+                // buildSyncTask 自行分配 struct 并持有 pool/字符串; 失败时内部全部回收,
+                // errdefer 语义由其内部 errdefer 链保证 (不再有 init 失败部分泄漏).
                 const ds = (try meta.datasource.Service.findByMallId(self.store, self.allocator, cfg.source_db)) orelse {
                     common.logger.err_("任务 {d} (source_db={s}) 绑定的数据源不存在", .{ task_id, cfg.source_db });
                     return error.DatasourceNotFound;
@@ -508,40 +544,11 @@ pub const Scheduler = struct {
                     d.deinit(self.allocator);
                 }
 
-                const sync_mode: meta.task.SyncMode = switch (cfg.sync_mode) {
-                    0 => .full,
-                    1 => .poll,
-                    2 => .binlog,
-                    3 => .both,
-                    else => .poll,
-                };
-                const rcfg = runtime.RuntimeConfig{
-                    .task_id = cfg.id,
-                    .source_table = cfg.source_table,
-                    .target_table = cfg.target_table,
-                    .batch_size = 1000,
-                    .sync_mode = sync_mode,
-                    .enable_commission_calc = false,
-                    .mall_id = ds.mall_id,
-                };
-
-                const src_host = try self.allocator.dupe(u8, ds.host);
-                const src_db = try self.allocator.dupe(u8, ds.db_name);
-                const src_user = try self.allocator.dupe(u8, ds.username);
-                const src_pass = try self.allocator.dupe(u8, ds.password);
-                const src_cfg = zfinal.DBConfig{
-                    .db_type = .mysql,
-                    .host = src_host,
-                    .port = ds.port,
-                    .database = src_db,
-                    .username = src_user,
-                    .password = src_pass,
-                };
-                const src_pool = try zfinal.ConnectionPool.init(self.allocator, src_cfg, 1);
-
-                t.* = try runtime.SyncTask.init(self.allocator, rcfg, ds, self.store, self.sink_pool, src_pool, src_host, src_db, src_user, src_pass);
+                var ovp = parseV5Overrides(self.allocator, cfg.config_json);
+                defer ovp.deinit(self.allocator);
+                const rcfg = v5RuntimeConfig(cfg, ds, &ovp.ov);
+                break :blk try self.buildSyncTask(rcfg, ds);
             }
-            break :blk t;
         };
 
         // Fix C2: 新 task_ptr 清理 defer (覆盖 put/start 失败路径, 与 addTask 同款 cleanup_needed 模式).
@@ -644,9 +651,7 @@ pub const Scheduler = struct {
     ///   - 对每行调 `addTask`; 单个 task 失败不阻塞整体, 仅打 warn 继续.
     ///   - 用于 `main.zig` 启动 web server 之前, 让已配置的 active 任务自动跑起来.
     ///
-    /// 与 `bootstrapAll` 的区别:
-    ///   - `bootstrapAll` 加载 V1 `sync_task` 表 (旧路径, 兼容 Phase 1-4)
-    ///   - `loadFromDb`  加载 V5 `tasks_config` 表 (新路径, Phase 5 动态任务)
+    /// V5 收敛后唯一启动加载路径 (legacy bootstrapAll/sync_task 已移除).
     pub fn loadFromDb(self: *Scheduler) !void {
         var svc = meta.task.service.Service{ .store = self.store };
         const cfgs = try svc.list(.active);
@@ -669,20 +674,6 @@ pub const Scheduler = struct {
         common.logger.inf("loadFromDb 完成: {d} 任务加载, {d} 启动失败", .{ succeeded, failed });
     }
 
-    /// 启动所有 status=1 的任务 (启动时调用)
-    pub fn bootstrapAll(self: *Scheduler) !void {
-        const tasks = try meta.task.Service.findEnabled(self.store, self.allocator);
-        defer {
-            for (tasks) |*t| t.deinit(self.allocator);
-            self.allocator.free(tasks);
-        }
-        common.logger.inf("启动时发现 {d} 个已启用任务", .{tasks.len});
-        for (tasks) |t| {
-            self.startTask(t.id) catch |err| {
-                common.logger.err_("任务 {d} 启动失败: {s}", .{ t.id, @errorName(err) });
-            };
-        }
-    }
 
     /// P1 任务 1.8: 优雅停机 — 拒绝新 task 启动 + 信号所有运行中 task 退出当前 batch.
     ///
@@ -801,23 +792,7 @@ test "scheduler: stopAll sets is_shutting_down and returns task count" {
     try std.testing.expect(sched.is_shutting_down.load(.acquire));
 }
 
-test "scheduler: startTask returns ShutdownInProgress when shutting down" {
-    const a = std.testing.allocator;
-    var store = try makeTestStore(a);
-    defer store.deinit();
-    const pool = try makeTestPool(a);
-    defer pool.deinit();
 
-    var sched = Scheduler.init(a, &store, pool);
-    defer sched.deinit();
-
-    // 模拟收到停机信号
-    sched.is_shutting_down.store(true, .release);
-
-    // 任意 task_id 都应被拒绝, 不应触达 DB
-    const result = sched.startTask(999);
-    try std.testing.expectError(error.ShutdownInProgress, result);
-}
 
 // ============================================================
 // V5 Phase 5 Task 3: addTask / removeTask (动态任务管理)
@@ -1054,4 +1029,109 @@ test "Scheduler loadFromDb hydrates all active tasks but skips disabled" {
     }
     try std.testing.expectEqual(@as(usize, 1), list.len);
     try std.testing.expectEqualStrings("a", list[0].name);
+}
+
+// ===== V5 config_json 透传测试 =====
+
+fn testDatasource() meta.datasource.Datasource {
+    return .{
+        .id = 1,
+        .mall_id = "mall_test",
+        .ds_type = "mysql",
+        .host = "127.0.0.1",
+        .port = 3306,
+        .db_name = "shop",
+        .username = "u",
+        .password = "p",
+        .remark = null,
+        .status = 1,
+        .created_at = "",
+        .updated_at = "",
+    };
+}
+
+test "parseV5Overrides: batch_size / filter / commission / field_mappings string" {
+    const a = std.testing.allocator;
+    var ovp = parseV5Overrides(a,
+        \\{"batch_size": 500,
+        \\ "field_mappings": "[{\"source\":\"amount\",\"target\":\"order_total\"}]",
+        \\ "filter": {"field": "amount", "op": "gt", "value": "100"},
+        \\ "enable_commission_calc": true}
+    );
+    defer ovp.deinit(a);
+    try std.testing.expectEqual(@as(u32, 500), ovp.ov.batch_size);
+    try std.testing.expectEqualStrings("[{\"source\":\"amount\",\"target\":\"order_total\"}]", ovp.ov.field_mappings_json.?);
+    try std.testing.expectEqualStrings("amount", ovp.ov.filter_field.?);
+    try std.testing.expectEqual(transform.engine.FilterOp.gt, ovp.ov.filter_op);
+    try std.testing.expectEqualStrings("100", ovp.ov.filter_value.?);
+    try std.testing.expect(ovp.ov.enable_commission_calc);
+}
+
+test "parseV5Overrides: field_mappings object is stringified back to JSON" {
+    const a = std.testing.allocator;
+    var ovp = parseV5Overrides(a,
+        \\{"field_mappings": {"amount": "order_total", "id": "dt_id"}}
+    );
+    defer ovp.deinit(a);
+    const fm = ovp.ov.field_mappings_json.?;
+    try std.testing.expect(std.mem.indexOf(u8, fm, "order_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fm, "dt_id") != null);
+}
+
+test "parseV5Overrides: transform.naming_rules pipeline + heap variant freed on deinit" {
+    const a = std.testing.allocator;
+    var ovp = parseV5Overrides(a,
+        \\{"transform": {"naming_rules": [{"type":"camel_to_snake"}, {"type":"add_prefix","value":"dt_"}],
+        \\               "mask_phone": true}}
+    );
+    defer ovp.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), ovp.ov.transform.naming_rules.len);
+    try std.testing.expect(ovp.ov.transform.mask_phone);
+    // deinit 由 defer 执行 — testing allocator 会捕获任何泄漏
+}
+
+test "parseV5Overrides: invalid JSON degrades to defaults without error" {
+    const a = std.testing.allocator;
+    var ovp = parseV5Overrides(a, "{not valid json");
+    defer ovp.deinit(a);
+    try std.testing.expectEqual(@as(u32, 1000), ovp.ov.batch_size);
+    try std.testing.expect(ovp.ov.field_mappings_json == null);
+    try std.testing.expect(ovp.ov.filter_field == null);
+    try std.testing.expect(!ovp.ov.enable_commission_calc);
+}
+
+test "parseV5Overrides: out-of-range batch_size falls back to default" {
+    const a = std.testing.allocator;
+    var ovp = parseV5Overrides(a, "{\"batch_size\": 999999999}");
+    defer ovp.deinit(a);
+    try std.testing.expectEqual(@as(u32, 1000), ovp.ov.batch_size);
+}
+
+test "v5RuntimeConfig: sync_mode mapping + overrides applied + mall_id from datasource" {
+    const a = std.testing.allocator;
+    var ovp = parseV5Overrides(a,
+        \\{"batch_size": 256, "enable_commission_calc": true,
+        \\ "filter": {"field": "amount", "op": "lte", "value": "50"}}
+    );
+    defer ovp.deinit(a);
+    const cfg = meta.task.config.TaskConfig{ .id = 7, .sync_mode = 3 };
+    const rcfg = v5RuntimeConfig(cfg, testDatasource(), &ovp.ov);
+    try std.testing.expectEqual(meta.task.SyncMode.both, rcfg.sync_mode);
+    try std.testing.expectEqual(@as(u32, 256), rcfg.batch_size);
+    try std.testing.expect(rcfg.enable_commission_calc);
+    try std.testing.expectEqual(transform.engine.FilterOp.lte, rcfg.filter_op);
+    try std.testing.expectEqualStrings("mall_test", rcfg.mall_id);
+}
+
+test "v5RuntimeConfig: sync_mode 0=full 2=binlog, unknown falls back to poll" {
+    const a = std.testing.allocator;
+    var ovp = V5ParsedOverrides{};
+    defer ovp.deinit(a);
+    const ds = testDatasource();
+    const full = v5RuntimeConfig(.{ .id = 1, .sync_mode = 0 }, ds, &ovp.ov);
+    try std.testing.expectEqual(meta.task.SyncMode.full, full.sync_mode);
+    const binlog = v5RuntimeConfig(.{ .id = 2, .sync_mode = 2 }, ds, &ovp.ov);
+    try std.testing.expectEqual(meta.task.SyncMode.binlog, binlog.sync_mode);
+    const fallback = v5RuntimeConfig(.{ .id = 3, .sync_mode = 9 }, ds, &ovp.ov);
+    try std.testing.expectEqual(meta.task.SyncMode.poll, fallback.sync_mode);
 }

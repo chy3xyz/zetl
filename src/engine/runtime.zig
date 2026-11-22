@@ -1,4 +1,4 @@
-//! SyncTask 运行时 — zfinal (≥ v0.27, DB.init 返回 *DB) + 堆字符串寿命管理
+//! SyncTask 运行时 — zfinal (≥ v0.28, DB.init 返回 *DB) + 堆字符串寿命管理
 
 const std = @import("std");
 const zfinal = @import("zfinal");
@@ -19,6 +19,17 @@ pub const RuntimeConfig = struct {
     sync_mode: meta.task.SyncMode = .both,
     field_mappings_json: ?[]const u8 = null,
     filter_condition: ?[]const u8 = null,
+    /// 行级过滤 (engine 生效路径: filter_field + filter_op + filter_value 数值比较).
+    /// 注: filter_condition (SQL 式表达式) 在 engine 中暂未消费, 仅保留字段.
+    filter_field: ?[]const u8 = null,
+    filter_op: transform.engine.FilterOp = .gte,
+    filter_value: ?[]const u8 = null,
+    /// Phase 10/11: PII 脱敏开关 (engine process() 内按字段名子串匹配).
+    mask_phone: bool = false,
+    mask_email: bool = false,
+    mask_id_card: bool = false,
+    mask_all: bool = false,
+    case_insensitive_fields: bool = true,
     enable_commission_calc: bool = false,
     full_sync_sleep_ms: u64 = 50,
     incremental_poll_ms: u64 = 1000,
@@ -93,6 +104,16 @@ pub const SyncTask = struct {
                 .enable_commission_calc = cfg.enable_commission_calc,
                 // Phase 6c: naming_rules pipeline 传给 TransformConfig.
                 .naming_rules = cfg.naming_rules,
+                // 行级过滤 (filter_field/op/value) + mask 开关 (V5 config_json 透传).
+                // engine init 会 dupe 字符串, RuntimeConfig 侧仅需借用.
+                .filter_field = cfg.filter_field,
+                .filter_op = cfg.filter_op,
+                .filter_value = cfg.filter_value,
+                .mask_phone = cfg.mask_phone,
+                .mask_email = cfg.mask_email,
+                .mask_id_card = cfg.mask_id_card,
+                .mask_all = cfg.mask_all,
+                .case_insensitive_fields = cfg.case_insensitive_fields,
             };
             // 临时 self 仅含 fetchSourceColumns 所需字段 (allocator, src_pool, _sh, cfg).
             // SyncTask 尚未构造, 用 undefined 占位未访问字段, 仅设置本次调用会读的字段.
@@ -122,7 +143,7 @@ pub const SyncTask = struct {
                 sk.pool,
                 sk.target_table,
                 cols,
-                .{},
+                .{ .pk_column = cfg.pk_column },
             ) catch |err| {
                 common.logger.warn("[task {d}] ensureTargetTable 失败: {s}, 继续 (假设已存在)", .{ cfg.task_id, @errorName(err) });
             };
@@ -189,8 +210,9 @@ pub const SyncTask = struct {
             switch (current) {
                 .running => return error.AlreadyRunning,
                 .pending, .success, .@"error" => {
-                    if (self.state.cmpxchgStrong(current, .running, .acq_rel, .acquire) != null) break;
-                    // CAS 失败: 状态被并发改动, 重试.
+                    // cmpxchgStrong 返回 null = CAS 成功 (state 已置 running), 跳出循环去 spawn;
+                    // 非 null = 失败 (状态被并发改动), 重试.
+                    if (self.state.cmpxchgStrong(current, .running, .acq_rel, .acquire) == null) break;
                 },
             }
         }
@@ -439,11 +461,11 @@ pub const SyncTask = struct {
         defer self.src_pool.release(conn) catch {};
 
         // conn.query 要求 [:0]const u8 (null-terminated), allocPrintSentinel 返回的就是这种.
-        const sql = try std.fmt.allocPrintSentinel(self.allocator, "SHOW COLUMNS FROM `{s}`", .{self._sh}, 0);
+        const sql = try std.fmt.allocPrintSentinel(self.allocator, "SHOW COLUMNS FROM `{s}`", .{self.cfg.source_table}, 0);
         defer self.allocator.free(sql);
 
         var result = conn.query(sql) catch |err| {
-            common.logger.err_("[task {d}] SHOW COLUMNS FROM {s}: {s}", .{ self.cfg.task_id, self._sh, @errorName(err) });
+            common.logger.err_("[task {d}] SHOW COLUMNS FROM {s}: {s}", .{ self.cfg.task_id, self.cfg.source_table, @errorName(err) });
             return err;
         };
         defer result.deinit();
@@ -599,7 +621,8 @@ pub const SyncTask = struct {
         self.state.store(.@"error", .release);
         if (self.last_error) |e| self.allocator.free(e);
         self.last_error = self.allocator.dupe(u8, msg) catch null;
-        meta.task.Service.updateStatus(self.store, self.cfg.task_id, 2, msg) catch {};
+        // V5 收敛: 失败状态由 runtime_metrics (fail_count/last_error) 承载,
+        // tasks_config 无 error 态列, 不再回写 legacy sync_task.
     }
 };
 

@@ -30,6 +30,16 @@ fn createRole(store: *meta.store.MetaStore, name: []const u8, desc: []const u8, 
     }
 }
 
+/// 按角色名查 id (未找到返回 null)
+pub fn getRoleIdByName(store: *meta.store.MetaStore, name: []const u8) !?i64 {
+    var r = try store.db.queryParams("SELECT id FROM role WHERE role_name=$1", &.{.{ .text = name }});
+    defer r.deinit();
+    if (r.next()) {
+        if (try r.getInt(0)) |id| return id;
+    }
+    return null;
+}
+
 pub fn getUserPermissions(store: *meta.store.MetaStore, a: std.mem.Allocator, uid: i64) ![]u8 {
     var r = try store.db.queryParams(
         "SELECT rp.permission FROM role_permission rp JOIN user_role ur ON rp.role_id=ur.role_id WHERE ur.user_id=$1",

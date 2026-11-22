@@ -10,6 +10,11 @@ pub const DdlOptions = struct {
     database: []const u8 = "",
     engine: []const u8 = "InnoDB",
     charset: []const u8 = "utf8mb4",
+    /// 源表主键列名 (默认 "id" 由 caller 传入). 非空且存在于 columns 时,
+    /// 自动建表追加 UNIQUE KEY (mall_id, pk) — 没有唯一键时 sink 的
+    /// INSERT ... ON DUPLICATE KEY UPDATE 无法去重, 源行 UPDATE 后
+    /// re-sync 会重复插入 (2026-11-21 E2E 发现). pk 不在源列中则跳过, 幂等降级.
+    pk_column: []const u8 = "",
 };
 
 /// MySQL 类型常量 → 字符串. type 来自 mapper.ColumnMeta.type (MySQL 协议类型字节).
@@ -85,6 +90,38 @@ pub fn buildCreateTable(
         try col_parts.append(allocator, part);
     }
 
+    // 治理列 — TransformEngine.process 会注入这些列 (mall_id/source_type/sync_type/
+    // is_delete + 条件性 source_create_time/source_update_time), sync_time 依赖
+    // DEFAULT CURRENT_TIMESTAMP 自动填充. DDL 与 flush 的 INSERT 列集必须一致,
+    // 否则首次增量 flush 即报 Unknown column (2026-11-21 E2E 实测踩坑).
+    const governance_cols = [_][]const u8{
+        "    `mall_id` VARCHAR(64) NULL",
+        "    `source_type` VARCHAR(16) NULL",
+        "    `sync_type` VARCHAR(8) NULL",
+        "    `sync_time` DATETIME NULL DEFAULT CURRENT_TIMESTAMP",
+        "    `is_delete` TINYINT NULL DEFAULT 0",
+        "    `source_create_time` DATETIME NULL",
+        "    `source_update_time` DATETIME NULL",
+    };
+    for (governance_cols) |g| {
+        try col_parts.append(allocator, try allocator.dupe(u8, g));
+    }
+
+    // 幂等唯一键: (mall_id, pk_column). mall_id 由 TransformEngine 注入, pk 从源表主键透传.
+    const has_pk = options.pk_column.len > 0 and blk: {
+        for (columns) |c| {
+            if (std.mem.eql(u8, c.name, options.pk_column)) break :blk true;
+        }
+        break :blk false;
+    };
+    if (has_pk) {
+        const pk_quoted = try quoteIdentifier(allocator, options.pk_column);
+        defer allocator.free(pk_quoted);
+        // 所有权移交 col_parts (cleanup loop 统一 free)
+        const uk = try std.fmt.allocPrint(allocator, "    UNIQUE KEY uk_zetl_mall_pk (`mall_id`, {s})", .{pk_quoted});
+        try col_parts.append(allocator, uk);
+    }
+
     var cols_buf = std.ArrayList(u8).empty;
     defer cols_buf.deinit(allocator);
     for (col_parts.items, 0..) |part, i| {
@@ -149,4 +186,33 @@ test "buildCreateTable uses DECIMAL(P,S) from ColumnMeta" {
     defer a.free(ddl);
     try std.testing.expect(std.mem.indexOf(u8, ddl, "`amount` DECIMAL(10,2)") != null);
     try std.testing.expect(std.mem.indexOf(u8, ddl, "DECIMAL(18,4)") == null);
+}
+
+test "buildCreateTable appends unique key when pk_column present" {
+    const a = std.testing.allocator;
+    const cols = [_]mapper.ColumnMeta{
+        .{ .name = "id", .type = 0x08 },
+        .{ .name = "amount", .type = 0xf6, .precision = 10, .scale = 2 },
+    };
+    const ddl = try buildCreateTable(a, "orders", &cols, .{ .pk_column = "id" });
+    defer a.free(ddl);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "UNIQUE KEY uk_zetl_mall_pk (`mall_id`, `id`)") != null);
+    // 治理列也在
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "`sync_type` VARCHAR(8)") != null);
+}
+
+test "buildCreateTable skips unique key when pk_column missing from columns" {
+    const a = std.testing.allocator;
+    const cols = [_]mapper.ColumnMeta{.{ .name = "code", .type = 0x0f }};
+    const ddl = try buildCreateTable(a, "t", &cols, .{ .pk_column = "id" });
+    defer a.free(ddl);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "UNIQUE KEY") == null);
+}
+
+test "buildCreateTable skips unique key when pk_column empty" {
+    const a = std.testing.allocator;
+    const cols = [_]mapper.ColumnMeta{.{ .name = "id", .type = 0x08 }};
+    const ddl = try buildCreateTable(a, "t", &cols, .{});
+    defer a.free(ddl);
+    try std.testing.expect(std.mem.indexOf(u8, ddl, "UNIQUE KEY") == null);
 }

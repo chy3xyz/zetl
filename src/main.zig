@@ -50,6 +50,9 @@ pub fn main(init: std.process.Init) !void {
     auth.role.initRoles(&store) catch |err| {
         common.logger.warn("initRoles failed (OK on first boot): {s}", .{@errorName(err)});
     };
+    auth.user.ensureBootstrapAdmin(&store, allocator, cfg.meta.admin_username, cfg.meta.admin_password) catch |err| {
+        common.logger.warn("ensureBootstrapAdmin failed: {s}", .{@errorName(err)});
+    };
 
     // 7. 初始化 scheduler
     const scheduler = try allocator.create(engine.scheduler.Scheduler);
@@ -57,12 +60,7 @@ pub fn main(init: std.process.Init) !void {
     scheduler.* = engine.scheduler.Scheduler.init(allocator, &store, sink_pool);
     global_scheduler = scheduler;
 
-    // 7. 启动时加载所有 status=1 任务 (V1/V2 sync_task 表, 旧路径)
-    scheduler.bootstrapAll() catch |err| {
-        common.logger.err_("启动任务失败: {s}", .{@errorName(err)});
-    };
-
-    // 7b. V5 Phase 5: 从 tasks_config 表加载所有 active 任务 (新路径, 动态任务)
+    // 7. 启动时加载 tasks_config 中所有 active 任务 (V5 收敛后唯一任务系统)
     scheduler.loadFromDb() catch |err| {
         common.logger.warn("loadFromDb 失败: {s}", .{@errorName(err)});
     };
@@ -129,6 +127,7 @@ test {
     _ = @import("auth/user.zig");
     _ = @import("auth/role.zig");
     _ = @import("web/handler/auth.zig");
+    _ = @import("pool_mysql_live_test.zig"); // env 门控 live MySQL pool 测试
     _ = @import("web/handler/tasks.zig");
     _ = @import("config.zig");
 }

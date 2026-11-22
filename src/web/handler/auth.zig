@@ -38,7 +38,7 @@ pub fn login(ctx: *zfinal.Context) !void {
     try response.fail(ctx, .permission_denied, "账号或密码错误");
 }
 
-/// GET /api/v1/auth/me  (示例: 需鉴权接口)
+/// GET /api/v1/auth/me
 pub fn me(ctx: *zfinal.Context) !void {
     const token = response.extractToken(ctx) orelse {
         try response.fail(ctx, .permission_denied, "未携带 token");
@@ -48,8 +48,10 @@ pub fn me(ctx: *zfinal.Context) !void {
         try response.fail(ctx, .permission_denied, "token 无效或已过期");
         return;
     }
+    // token → username 反查 (RBAC 用户返回真实账号; 引导账号 fallback admin)
+    const username = deps.getUsernameByToken(token) orelse deps.config_ptr.meta.admin_username;
     try response.ok(ctx, .{
-        .username = deps.config_ptr.meta.admin_username,
+        .username = username,
     });
 }
 

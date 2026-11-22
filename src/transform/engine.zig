@@ -32,7 +32,6 @@ pub const TransformConfig = struct {
     mall_id: []const u8,
     source_type: []const u8 = "mysql",
     field_mappings_json: ?[]const u8 = null,
-    filter_condition: ?[]const u8 = null, // V1 简化为 >= 比较 (按字段)
     enable_commission_calc: bool = false,
     /// 可选: 用于过滤的字段名 (与 filter_value 配合, 数值比较)
     filter_field: ?[]const u8 = null,
@@ -339,7 +338,6 @@ pub const TransformEngine = struct {
                 .mall_id = try allocator.dupe(u8, cfg.mall_id),
                 .source_type = try allocator.dupe(u8, cfg.source_type),
                 .field_mappings_json = if (cfg.field_mappings_json) |fm| try allocator.dupe(u8, fm) else null,
-                .filter_condition = if (cfg.filter_condition) |f| try allocator.dupe(u8, f) else null,
                 .enable_commission_calc = cfg.enable_commission_calc,
                 .filter_field = if (cfg.filter_field) |f| try allocator.dupe(u8, f) else null,
                 .filter_op = cfg.filter_op,
@@ -375,7 +373,6 @@ pub const TransformEngine = struct {
                 .mall_id = try allocator.dupe(u8, cfg.mall_id),
                 .source_type = try allocator.dupe(u8, cfg.source_type),
                 .field_mappings_json = if (cfg.field_mappings_json) |fm| try allocator.dupe(u8, fm) else null,
-                .filter_condition = if (cfg.filter_condition) |f| try allocator.dupe(u8, f) else null,
                 .enable_commission_calc = cfg.enable_commission_calc,
                 .filter_field = if (cfg.filter_field) |f| try allocator.dupe(u8, f) else null,
                 .filter_op = cfg.filter_op,
@@ -394,7 +391,6 @@ pub const TransformEngine = struct {
         self.allocator.free(self.cfg.mall_id);
         self.allocator.free(self.cfg.source_type);
         if (self.cfg.field_mappings_json) |fm| self.allocator.free(fm);
-        if (self.cfg.filter_condition) |f| self.allocator.free(f);
         if (self.cfg.filter_field) |f| self.allocator.free(f);
         if (self.cfg.filter_value) |v| self.allocator.free(v);
         // 释放 naming_rule 的 add_prefix / strip_prefix prefix slice

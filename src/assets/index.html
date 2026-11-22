@@ -77,7 +77,7 @@
               <li><code>POST /api/v1/auth/login</code> - 登录获取 token</li>
               <li><code>GET /api/v1/monitor/overview</code> - 监控概览</li>
               <li><code>POST /api/v1/datasource</code> - 新增数据源</li>
-              <li><code>POST /api/v1/task</code> - 创建同步任务</li>
+              <li><code>POST /api/tasks</code> - 创建同步任务 (V5)</li>
             </ul>
           </div>
         </div>
@@ -144,19 +144,20 @@
           <div class="bg-white rounded-lg shadow p-4">
             <h3 class="font-bold text-gray-800 mb-3">创建同步任务</h3>
             <form @submit.prevent="createTask()" class="grid grid-cols-2 md:grid-cols-3 gap-3">
-              <input x-model="taskForm.task_name" placeholder="任务名" class="border rounded px-2 py-1 text-sm" required>
-              <select x-model.number="taskForm.datasource_id" class="border rounded px-2 py-1 text-sm" required>
-                <option value="">选择数据源</option>
+              <input x-model="taskForm.name" placeholder="任务名" class="border rounded px-2 py-1 text-sm" required>
+              <select x-model="taskForm.source_db" class="border rounded px-2 py-1 text-sm" required>
+                <option value="">选择数据源 (mall_id)</option>
                 <template x-for="d in datasources" :key="d.id">
-                  <option :value="d.id" x-text="d.mall_id + ' (' + d.id + ')'"></option>
+                  <option :value="d.mall_id" x-text="d.mall_id"></option>
                 </template>
               </select>
               <input x-model="taskForm.source_table" placeholder="源表" class="border rounded px-2 py-1 text-sm" required>
               <input x-model="taskForm.target_table" placeholder="目标表" class="border rounded px-2 py-1 text-sm" required>
-              <select x-model="taskForm.sync_mode" class="border rounded px-2 py-1 text-sm">
-                <option value="full">全量</option>
-                <option value="cdc">增量</option>
-                <option value="both" selected>全量+增量</option>
+              <select x-model.number="taskForm.sync_mode" class="border rounded px-2 py-1 text-sm">
+                <option :value="0">仅全量</option>
+                <option :value="1">轮询增量</option>
+                <option :value="2">binlog CDC</option>
+                <option :value="3" selected>全量+binlog (推荐)</option>
               </select>
               <input x-model.number="taskForm.batch_size" type="number" placeholder="batch_size" class="border rounded px-2 py-1 text-sm" value="1000">
               <button type="submit" class="px-4 py-1 bg-blue-500 text-white text-sm rounded hover:bg-blue-600 col-span-3">创建任务</button>
@@ -180,7 +181,7 @@
                 <template x-for="t in tasks" :key="t.id">
                   <tr class="border-t hover:bg-gray-50">
                     <td class="px-4 py-2" x-text="t.id"></td>
-                    <td class="px-4 py-2" x-text="t.task_name"></td>
+                    <td class="px-4 py-2" x-text="t.name"></td>
                     <td class="px-4 py-2 font-mono" x-text="t.source_table"></td>
                     <td class="px-4 py-2 font-mono" x-text="t.target_table"></td>
                     <td class="px-4 py-2" x-text="t.sync_mode"></td>
@@ -189,8 +190,8 @@
                     </td>
                     <td class="px-4 py-2 space-x-1">
                       <button @click="startTask(t)" :disabled="t.status === 1" class="px-2 py-0.5 bg-green-500 text-white text-xs rounded disabled:bg-gray-300">启动</button>
-                      <button @click="stopTask(t)" :disabled="t.status !== 1" class="px-2 py-0.5 bg-yellow-500 text-white text-xs rounded disabled:bg-gray-300">停止</button>
-                      <button @click="deleteTask(t)" :disabled="t.status === 1" class="px-2 py-0.5 bg-red-500 text-white text-xs rounded disabled:bg-gray-300">删除</button>
+                      <button @click="stopTask(t)" class="px-2 py-0.5 bg-yellow-500 text-white text-xs rounded">停止</button>
+                      <button @click="deleteTask(t)" class="px-2 py-0.5 bg-red-500 text-white text-xs rounded">删除</button>
                     </td>
                   </tr>
                 </template>
@@ -210,7 +211,7 @@
               <select x-model.number="monitorTaskId" class="border rounded px-2 py-1 text-sm">
                 <option value="0">选择任务</option>
                 <template x-for="t in tasks" :key="t.id">
-                  <option :value="t.id" x-text="'#' + t.id + ' ' + t.task_name"></option>
+                  <option :value="t.id" x-text="'#' + t.id + ' ' + t.name"></option>
                 </template>
               </select>
               <button @click="loadTaskMetrics()" class="px-3 py-1 bg-blue-500 text-white text-sm rounded">查询</button>
@@ -266,12 +267,12 @@
         taskMetrics: null,
         monitorTaskId: 0,
         dsForm: { mall_id: '', host: '127.0.0.1', port: 3306, db_name: '', username: 'root', password: '', remark: '' },
-        taskForm: { task_name: '', datasource_id: '', source_table: '', target_table: 'union_all_order', sync_mode: 'both', batch_size: 1000 },
+        taskForm: { name: '', source_db: '', source_table: '', target_table: 'union_all_order', sync_mode: 3, status: 1, config_json: '{}' },
         dsMsg: '', dsErr: false, taskMsg: '', taskErr: false,
 
         currentTab() { return this.menu.find(m => m.key === this.tab) || this.menu[0]; },
-        statusText(s) { return ['停止', '运行中', '异常'][s] || '未知'; },
-        statusClass(s) { return { 0: 'bg-gray-100 text-gray-600', 1: 'bg-green-100 text-green-800', 2: 'bg-red-100 text-red-800' }[s] || 'bg-gray-100'; },
+        statusText(s) { return { 0: '已停用', 1: '已启用' }[s] || '未知'; },
+        statusClass(s) { return { 0: 'bg-gray-100 text-gray-600', 1: 'bg-green-100 text-green-800' }[s] || 'bg-gray-100'; },
 
         async api(path, opts = {}) {
           if (!this.token && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/health')) {
@@ -313,7 +314,7 @@
             if (r1) { const j = await r1.json(); if (j.code === 0) this.overview = j.data; }
             const r2 = await this.api('/api/v1/datasource/list');
             if (r2) { const j = await r2.json(); if (j.code === 0) this.datasources = j.data.list || []; }
-            const r3 = await this.api('/api/v1/task/list');
+            const r3 = await this.api('/api/tasks');
             if (r3) { const j = await r3.json(); if (j.code === 0) this.tasks = j.data.list || []; }
           } catch (e) { console.error('refresh failed', e); }
         },
@@ -335,27 +336,41 @@
 
         async createTask() {
           this.taskMsg = ''; this.taskErr = false;
-          const r = await this.api('/api/v1/task', { method: 'POST', body: JSON.stringify(this.taskForm) });
+          // V5: batch_size 等透传键放 config_json 嵌套 JSON 字符串里
+          const body = {
+            name: this.taskForm.name,
+            source_db: this.taskForm.source_db,
+            source_table: this.taskForm.source_table,
+            target_table: this.taskForm.target_table,
+            sync_mode: this.taskForm.sync_mode,
+            status: this.taskForm.status,
+            config_json: JSON.stringify({ batch_size: this.taskForm.batch_size }),
+          };
+          const r = await this.api('/api/tasks', { method: 'POST', body: JSON.stringify(body) });
           const j = await r.json();
-          if (j.code === 0) { this.taskMsg = '✓ 创建成功, id=' + j.data.id; this.refreshAll(); }
-          else { this.taskErr = true; this.taskMsg = '✗ ' + j.msg; }
+          if (j.code === 0) {
+            if (j.data.status === 'running') this.taskMsg = '✓ 创建成功并已启动, id=' + j.data.id;
+            else this.taskMsg = '✓ 已保存 (启动失败: ' + (j.data.scheduler_error || '?') + '), id=' + j.data.id;
+            this.refreshAll();
+          } else { this.taskErr = true; this.taskMsg = '✗ ' + j.msg; }
         },
 
         async startTask(t) {
-          const r = await this.api('/api/v1/task/' + t.id + '/start', { method: 'POST' });
+          // V5: 启动 = reload (按 tasks_config 最新配置重建并启动)
+          const r = await this.api('/api/tasks/' + t.id + '/reload', { method: 'POST' });
           const j = await r.json();
           if (j.code !== 0) alert('启动失败: ' + j.msg);
           this.refreshAll();
         },
         async stopTask(t) {
-          const r = await this.api('/api/v1/task/' + t.id + '/stop', { method: 'POST' });
+          const r = await this.api('/api/tasks/' + t.id + '/stop', { method: 'POST' });
           const j = await r.json();
           if (j.code !== 0) alert('停止失败: ' + j.msg);
           this.refreshAll();
         },
         async deleteTask(t) {
-          if (!confirm('确认删除任务 ' + t.task_name + '?')) return;
-          const r = await this.api('/api/v1/task/' + t.id, { method: 'DELETE' });
+          if (!confirm('确认删除任务 ' + t.name + '?')) return;
+          const r = await this.api('/api/tasks/' + t.id, { method: 'DELETE' });
           const j = await r.json();
           if (j.code === 0) { this.refreshAll(); } else { alert('删除失败: ' + j.msg); }
         },
