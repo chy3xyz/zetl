@@ -34,36 +34,28 @@ CREATE TABLE union_all_user (
 );
 ```
 
-## 完整 `config_json`
+## 请求体 (`POST /api/tasks`)
 
-```json
-{
-  "name": "user-sync-from-mall-001",
-  "sync_mode": "both",
-  "source": {
-    "host": "polar-001.local", "port": 3306,
-    "user": "etl", "password": "<encrypted>",
-    "db": "mall_001", "table": "users",
-    "mall_id": "mall-001"
-  },
-  "target": {
-    "host": "central.local", "port": 3306,
-    "user": "etl", "password": "<encrypted>",
-    "db": "central", "table": "union_all_user"
-  },
-  "transform": {
-    "field_mappings_json": "[{\"source\":\"phone\",\"target\":\"phone\",\"default\":\"****\"}]"
-  },
-  "sink": {
-    "on_conflict": "replace",
-    "batch_size": 500
-  }
-}
+```bash
+curl -X POST http://127.0.0.1:18080/api/tasks \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "name": "user-sync-from-mall-001",
+    "source_db": "mall-001",
+    "source_table": "users",
+    "target_table": "union_all_user",
+    "sync_mode": 1,
+    "status": 1,
+    "config_json": "{\"batch_size\": 500, \"transform\": {\"mask_all\": true}}"
+  }'
 ```
+
+- `sync_mode: 1` (poll) = 全量 + update_time 轮询增量 (用户表无 binlog 需求时最简单).
+- `config_json.transform.mask_all: true` = mask_phone + mask_email + mask_id_card 全开.
 
 ## 字段解读
 
-- `transform.field_mappings_json`: 当前仅支持字段重命名 + 默认值填充; 手机号脱敏请用下方的 `mask_phone` 简写.
+- `config_json.field_mappings`: 覆盖映射 (重命名/默认值); 手机号脱敏请用下方的 `mask_phone` 简写.
 - `batch_size = 500`: 用户表无金额计算, 可放大批量.
 
 ## mask 快捷开关 (Phase 10/11)
@@ -81,33 +73,7 @@ CREATE TABLE union_all_user (
 - 字段名匹配是子串 (含 `phone` / `mobile` / `tel` 等关键词)
 - id_card 不会误命中 `user_id` (要求 `id_card` / `idcard` / `id_no` / `idnum` / `identity` 子串)
 
-### 完整 user-sync config_json (含 mask_all)
-
-```json
-{
-  "name": "user-sync-from-mall-001",
-  "sync_mode": "both",
-  "source": {
-    "host": "polar-001.local", "port": 3306,
-    "user": "etl", "password": "<encrypted>",
-    "db": "mall_001", "table": "users",
-    "mall_id": "mall-001"
-  },
-  "target": {
-    "host": "central.local", "port": 3306,
-    "user": "etl", "password": "<encrypted>",
-    "db": "central", "table": "union_all_user"
-  },
-  "transform": {
-    "mask_all": true
-  },
-  "sink": {
-    "on_conflict": "replace",
-    "batch_size": 500
-  }
-}
-```
-
+`mask_phone` / `mask_email` / `mask_id_card` 可单独开关 (写在 `config_json.transform` 内).
 `phone = "13800138000"` → `"138****8000"`, `email = "alice@example.com"` → `"a****@example.com"`, `id_card = "110101199001011234"` → `"110101********1234"`.
 
 ## 验证步骤

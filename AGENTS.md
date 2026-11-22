@@ -8,11 +8,12 @@
 
 ## 项目概述
 
-zetl 是一个基于 Zig 0.17 + zfinal v0.27.0 的多源 MySQL 数据归集 ETL 引擎。
+zetl 是一个基于 Zig 0.17.0 stable + zfinal v0.28.11 的多源 MySQL 数据归集 ETL 引擎。
 
-- **框架**: zfinal v0.27.0 (`build.zig.zon` 用 `git+https` 固定 tag + commit, 升级时用 `zig fetch "git+https://github.com/chy3xyz/zfinal.git?ref=<tag>"` 取 hash 后手工补 `.url`/`.hash`; zent v0.31.0 经 zfinal 传递拉取)
-- **编译器**: Zig 0.17.0-dev.1970 (zigup; `~/.zig` → `~/.local/share/zigup/0.17.0-dev.1970+67f39b551/files`; zfinal v0.26.1+ 要求 1970, 1567 缺 `Io.Operation.net_write`)
+- **框架**: zfinal v0.28.11 (`build.zig.zon` 用 `git+https` 固定 tag + commit, 升级时用 `zig fetch "git+https://github.com/chy3xyz/zfinal.git?ref=<tag>"` 取 hash 后手工补 `.url`/`.hash`; zent v0.78.0 经 zfinal 传递拉取)
+- **编译器**: Zig 0.17.0 stable (zigup; `~/.zig` → `~/.local/share/zigup/0.17.0/files`; zfinal v0.28.1+ 要求 stable, dev.2151 时代已结束)
 - **架构**: 6 大模块 — common/meta/cdc/transform/sink/engine/web
+- **任务系统**: V5 `/api/tasks` (tasks_config 表) 为唯一任务系统 — legacy `/api/v1/task` (sync_task 表) 已于 2026-11-21 移除, 消费方 (UI/reconcile/monitor/metrics/bootstrap) 全部迁移; V5 stop 语义 = `POST /api/tasks/:id/stop` (停实例留配置) 或 `PUT status=0` (停用)
 - **V2 新增**: reconcile / alarm / metrics / audit / auth (共 13 模块)
 
 ## 构建
@@ -57,6 +58,12 @@ pool.acquire() / pool.release(conn)         // 获取/归还连接
 ### RowData 所有权
 `transform.engine.freeRowData(allocator, &row)` — 释放 HashMap 内所有 key/value 并 deinit。必须对所有 process() 返回的 RowData 调用。
 
+### V5 config_json 透传 (scheduler)
+`/api/tasks` 的 `config_json` 支持键 (scheduler.parseV5Overrides, 失败降级默认 + warn):
+`batch_size` / `field_mappings` (string|object) / `filter: {field,op,value}` /
+`enable_commission_calc` / `transform.*` (naming_rules + mask 开关).
+字符串借用自解析 arena, TransformEngine 在 SyncTask.init 内 dupe — arena 存活到 init 返回即可.
+
 ### PollerConfig
 使用 `PollerConfig.fromSlices(host, port, user, pass, db, table, pk, ut, batch)` 创建，内部是 fixed-size buffers (`@splat(0)`)。
 
@@ -83,27 +90,39 @@ const cfg = .{ .host = host }; // 指向堆
   ─→ MySqlSink(批量 INSERT...ON DUPLICATE KEY) ─→ 归集 MySQL
 ```
 
+## 自动建表与幂等
+
+自动建表 (`ensureTargetTable`) 现在会追加 `UNIQUE KEY uk_zetl_mall_pk (mall_id, pk_column)`
+(pk_column 默认 "id", 来自源表主键), 让 `INSERT ... ON DUPLICATE KEY UPDATE` 真正幂等 —
+源行 UPDATE 后 re-sync 原位更新. pk 不在源列中时跳过唯一键 (幂等降级, warn 日志).
+若业务唯一键不是主键 (如 uk(mall_id, order_no)), 需预建目标表.
+
 ## 已知问题
 
-1. **任务线程 MySQL 连接** (`Lost connection at 'reading initial communication packet'`):
-   - `DB.init` 在子线程首行可用，但从 `ConnectionPool.acquire` 路径失败
-   - 主线程 API (testConnection) 100% 可靠
-   - 原因: Zig 0.17-dev 在 aarch64-macos 上的线程局部存储与 mysql C 库交互问题
-   - 进度: 上游 v0.25–v0.27 加固了 pool 并发 (burst stress / 事务并发回归测试网, double-release 检测, commit 失败回滚), 但均基于 SQLite 驱动验证; MySQL acquire 路径是否恢复**待实测**
-
+1. ~~**任务线程 MySQL 连接**~~ **已解决 (2026-11-21 实测)**:
+   - 历史: Zig 0.17-dev (1567/1970) + 旧 zfinal 上, 主线程创建的 ConnectionPool 在子线程 acquire 报 `Lost connection at 'reading initial communication packet'`
+   - 现状: zfinal v0.28.x pool 加固 + Zig 0.17.0 stable 后, 子线程 acquire/query/写入全部正常 (双 worker 并发实测通过)
+   - 回归测试: `src/pool_mysql_live_test.zig` (env 门控), 运行方式:
+     ```bash
+     # 需本地 MySQL, 先建库: CREATE DATABASE zetl_live_test; 并建表 t_live (id INT PK, v VARCHAR(32))
+     ZETL_LIVE_MYSQL=1 zig build -Ddriver_mysql=true test
+     # 可用 ZETL_LIVE_MYSQL_HOST/PORT/USER/PASS/DB 覆盖默认 root@127.0.0.1:3306/zetl_live_test
+     ```
 2. **TokenManager validate() 死锁**: V2 绕过，logout 靠客户端丢 token + 服务端 TTL
 
 ## 测试
 
 ```
-243 个单元测试 (zig build test / zig build -Ddriver_mysql=true test):
-  transform (69) / cdc (47, 含 binlog decoder 22) / auth (25) / engine (22)
-  reconcile (19) / alarm (15) / web (15) / sink (14) / meta (8) / audit (3)
-  main (2) / config (2) / common (2)
+255 个单元测试 (zig build test / zig build -Ddriver_mysql=true test):
+  transform (69) / cdc (47, 含 binlog decoder 22) / auth (26, 含 bootstrap admin 1)
+  / engine (29, 含 V5 config_json 透传 6) / reconcile (19) / alarm (15)
+  / web (16, 含 deps sweep 1)
+  / sink (17, 含 DDL 唯一键 3) / meta (8) / audit (3) / main (2) / config (2) / common (2)
+  / pool live (1, env 门控默认 SKIP)
 
-SQLite + MySQL 双构建通过; 已知怪癖: 重建后首次 zig build test 可能打印
-一行 "failed command" 但退出码为 0 — 0.17.0-dev.1970 构建器对 run step
-的显示噪音 (zfinal 仓库同样现象), 缓存命中后不再出现
+SQLite + MySQL 双构建通过; live MySQL 测试需 ZETL_LIVE_MYSQL=1 (见已知问题 #1);
+已知怪癖: 重建后首次 zig build test 可能打印一行 "failed command" 但退出码为 0
+— 构建器对 run step 的显示噪音, 缓存命中后不再出现
 ```
 
 ## P1 任务 1.5: 归集库不可达优雅降级 (2026-06)

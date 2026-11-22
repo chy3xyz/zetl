@@ -2,6 +2,10 @@
 
 ## 行为
 
+**幂等唯一键 (2026-11-21 起)**: 自动建表会追加 `UNIQUE KEY uk_zetl_mall_pk (mall_id, pk_column)`
+(pk_column 默认 "id" = 源表主键), 使 sink 的 upsert 幂等 — 源行 UPDATE 后 re-sync 原位更新不重复.
+若业务唯一键不是源主键, 请预建目标表 (自动建表仅 IF NOT EXISTS, 不会改动已存在的表).
+
 Phase 7 起, `SyncTask.init` 在写数据前会自动调用 `MySqlSink.ensureTargetTable`, 用 `CREATE TABLE IF NOT EXISTS db.target_table (...)` 创建目标表.
 
 ## 类型映射 (源 → MySQL DDL)

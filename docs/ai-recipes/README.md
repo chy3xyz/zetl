@@ -35,7 +35,7 @@
 ## 目录
 
 ### 入门
-- [00-task-config-schema.md](00-task-config-schema.md) — 完整 `config_json` 字段参考
+- [00-task-config-schema.md](00-task-config-schema.md) — 完整请求体字段参考 (顶层 + config_json 透传键)
 - [01-quickstart.md](01-quickstart.md) — 最小可运行例子
 
 ### 场景 Recipe
@@ -46,7 +46,7 @@
 
 ### 参考手册 (Reference)
 - [reference/transform-naming.md](reference/transform-naming.md) — `naming_rule` / `naming_rules`
-- [reference/transform-overrides.md](reference/transform-overrides.md) — `field_mappings_json`
+- [reference/transform-overrides.md](reference/transform-overrides.md) — `field_mappings` 覆盖映射
 - [reference/sink-ddl.md](reference/sink-ddl.md) — `ensureTargetTable` 自动建表
 - [reference/api-tasks.md](reference/api-tasks.md) — `/api/tasks/*` REST API
 

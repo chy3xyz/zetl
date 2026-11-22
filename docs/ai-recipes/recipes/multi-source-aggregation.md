@@ -6,36 +6,50 @@
 
 ## 实施方式
 
-不要写 30 个配置文件. 用一个 shell 脚本循环生成 30 个 task, POST 给 zetl.
+不要手写 30 份配置. 两步: 循环注册 30 个 datasource, 再循环创建 30 个 task.
 
-## 模板 `config_template.json`
+## Step 1: 批量注册数据源 `bulk-datasource.sh`
 
-```json
-{
-  "name": "order-sync-from-__MALL_ID__",
-  "sync_mode": "both",
-  "source": {
-    "host": "polar-__N__.local", "port": 3306,
-    "user": "etl", "password": "<encrypted>",
-    "db": "mall_001", "table": "orders",
-    "mall_id": "__MALL_ID__"
-  },
-  "target": {
-    "host": "central.local", "port": 3306,
-    "user": "etl", "password": "<encrypted>",
-    "db": "central", "table": "union_all_order"
-  },
-  "transform": {
-    "commission": {
-      "rate": 0.05,
-      "amount_field": "order_total"
-    }
-  },
-  "sink": {
-    "on_conflict": "replace",
-    "batch_size": 200
-  }
-}
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+TOKEN="<admin_token>"
+ZETL_URL="http://127.0.0.1:18080"
+
+for n in $(seq -w 1 30); do
+  mall_id="mall-$(printf '%03d' $((10#$n)))"
+  host="polar-${n}.local"
+
+  curl -s -X POST "${ZETL_URL}/api/v1/datasource" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{\"mall_id\":\"${mall_id}\",\"host\":\"${host}\",\"port\":3306,\"db_name\":\"mall_001\",\"username\":\"etl\",\"password\":\"etl\"}"
+  echo
+done
+```
+
+## Step 2: 批量创建任务 `bulk-create.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+TOKEN="<admin_token>"
+ZETL_URL="http://127.0.0.1:18080"
+
+for n in $(seq -w 1 30); do
+  mall_id="mall-$(printf '%03d' $((10#$n)))"
+
+  # config_json 是嵌套 JSON 字符串 — 内层双引号要转义两次
+  cj='{"batch_size": 200, "enable_commission_calc": true}'
+
+  curl -s -X POST "${ZETL_URL}/api/tasks" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{\"name\":\"order-sync-from-${mall_id}\",\"source_db\":\"${mall_id}\",\"source_table\":\"orders\",\"target_table\":\"union_all_order\",\"sync_mode\":3,\"status\":1,\"config_json\":\"${cj}\"}"
+  echo
+done
 ```
 
 ## 生成脚本 `bulk-create.sh`
@@ -65,16 +79,17 @@ done
 
 ## 字段解读
 
-- `__MALL_ID__` / `__N__` 是占位符, `sed` 替换成 `mall-001` / `001` 等.
-- 30 个任务全部 POST 到同一个 `target.union_all_order`, 通过 `mall_id` 区分.
+- 每个 task 的 `source_db` 指向同名 datasource (`mall-001` ... `mall-030`), datasource 的 `mall_id` 自动注入目标行.
+- 30 个任务写到同一个 `union_all_order`, 通过注入的 `mall_id` 列区分.
 - `UNIQUE KEY uk_mall_order(mall_id, order_no)` 保证不同 mall 的 order_no 互不冲突.
+- 注意: zetl 对同名 `name` 任务未做唯一性约束校验 (仅 SQLite `UNIQUE` 兜底), 重复跑脚本前先清库或换 name.
 
 ## 性能建议
 
 - 30 套 PolarDB 都在同一地域: zetl 单机 (4 核 8G) 可承载, 见 [PRD §5.1](../../../docs/zetl_prd.md) (单进程 ≥ 100 链路).
-- `sink.batch_size = 200` 在 PolarDB 写入场景是经验值, 大促可降到 50.
+- `config_json.batch_size = 200` 在 PolarDB 写入场景是经验值, 大促可降到 50.
 
 ## 验证
 
-1. 跑完 `bulk-create.sh` 后 `curl -H "Authorization: Bearer $TOKEN" $ZETL_URL/api/tasks | jq '. | length'` → `30`.
+1. 跑完 `bulk-create.sh` 后 `curl -H "Authorization: Bearer $TOKEN" "$ZETL_URL/api/tasks" | jq '.data.total'` → `30`.
 2. 任选 2 套 mall 各插一行, 目标 `union_all_order` 应有 2 行, `mall_id` 字段不同.

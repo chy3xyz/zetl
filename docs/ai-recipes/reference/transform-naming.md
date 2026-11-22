@@ -1,6 +1,10 @@
 # Naming Rule 速查 (Phase 6b / 6c)
 
-## 单规则形式 (`naming_rule`)
+> **配置位置**: 以下所有键都写在 `/api/tasks` 请求体的 `config_json` **字符串内层的 `transform` 对象**里:
+> `"config_json": "{\"transform\": {\"naming_rule\": \"camel_to_snake\"}}"`
+> (V1 legacy `/api/v1/task` 则放在 `field_mappings` 同级的 config JSON — 两处词汇表一致).
+
+## 单规则形式 (`transform.naming_rule`)
 
 ```
 "naming_rule": "identity"           // 不变
@@ -13,7 +17,7 @@
 "naming_rule": {"type":"regex_replace","pattern":"_tmp$","replacement":""}  // order_tmp → order
 ```
 
-## 链式规则 (`naming_rules`, Phase 6c)
+## 链式规则 (`transform.naming_rules`, Phase 6c)
 
 ```json
 {

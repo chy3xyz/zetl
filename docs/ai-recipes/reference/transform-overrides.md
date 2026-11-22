@@ -1,4 +1,9 @@
-# `field_mappings_json` 速查
+# `field_mappings` 速查 (legacy 名称: `field_mappings_json`)
+
+> **配置位置**: `/api/tasks` 请求体的 `config_json` **字符串内层的 root 级**:
+> `"config_json": "{\"field_mappings\": [{\"source\":\"amount\",\"target\":\"order_total\"}]}"`.
+> V1 legacy 任务 (`/api/v1/task`) 放在 `field_mappings` 字段. JSON 词汇表相同 (见下);
+> object/array 形式会自动序列化为文本 (V5 透传).
 
 ## 语法
 

@@ -2,9 +2,9 @@
 
 A lightweight data aggregation engine that consolidates tables from multiple MySQL sources into a single sink database, built on [Zig 0.17](https://ziglang.org) and the [zfinal](https://github.com/chy3xyz/zfinal) framework.
 
-[![Zig](https://img.shields.io/badge/Zig-0.17.0--dev.1970-orange)](https://ziglang.org)
-[![zfinal](https://img.shields.io/badge/zfinal-v0.27.0-blue)](https://github.com/chy3xyz/zfinal)
-[![Tests](https://img.shields.io/badge/tests-243%20passing-brightgreen)](#testing)
+[![Zig](https://img.shields.io/badge/Zig-0.17.0-orange)](https://ziglang.org)
+[![zfinal](https://img.shields.io/badge/zfinal-v0.28.11-blue)](https://github.com/chy3xyz/zfinal)
+[![Tests](https://img.shields.io/badge/tests-256%20passing-brightgreen)](#testing)
 
 ```
 source MySQL ──> Poller (PK pagination / update_time) or Binlog reader ──> RowEvent
@@ -17,7 +17,7 @@ source MySQL ──> Poller (PK pagination / update_time) or Binlog reader ─�
 - **Single-binary deployment** — ~4.8 MB (ReleaseSafe), bundles the web UI, REST API and ETL engine
 - **Multi-source aggregation** — many business databases → one sink database
 - **Three sync modes** — `poll` (PK pagination for full + `update_time` for incremental), `binlog` (real CDC, tombstone-aware), or `both` (full backfill then incremental)
-- **Automatic schema handling** — source columns discovered via `SHOW COLUMNS`, target table auto-created with exact `VARCHAR(N)` / `DECIMAL(P,S)` types
+- **Automatic schema handling** — source columns discovered via `SHOW COLUMNS`, target table auto-created with exact `VARCHAR(N)` / `DECIMAL(P,S)` types and an idempotent `(mall_id, pk)` unique key
 - **Transform pipeline** — field mapping with defaults and type overrides, column naming rules (`camel_to_snake`, prefix, regex replace, chained), row filters, tiered commission calculation, PII masking (phone / email / id-card)
 - **Idempotent writes** — batched upserts, safe to re-run
 - **Scheduled reconciliation** — cron-driven row/amount diff between source and sink, CSV export
@@ -37,7 +37,7 @@ Want to wire up a new sync scenario? The [docs/ai-recipes/](docs/ai-recipes/) de
 
 ## Quick Start
 
-Prerequisites: Zig 0.17.0-dev.1970, a MySQL 8.x sink (libmysqlclient), SQLite 3.
+Prerequisites: Zig 0.17.0, a MySQL 8.x sink (libmysqlclient), SQLite 3.
 
 ```bash
 # Build (SQLite only, no MySQL needed — used for unit tests)
@@ -94,7 +94,7 @@ cron_expr = "0 2 * * *"
 poll_interval_s = 60
 ```
 
-## API (37 endpoints)
+## API (32 endpoints)
 
 ```
 Public:
@@ -114,18 +114,13 @@ Protected (Bearer token):
   POST /api/v1/datasource/test             Test connection
   GET  /api/v1/datasource/list             List sources
   DELETE /api/v1/datasource/:id            Delete source
-  POST /api/v1/task                        Create task (legacy API)
-  GET  /api/v1/task/list                   List tasks
-  GET  /api/v1/task/:id                    Task detail
-  POST /api/v1/task/:id/start              Start task
-  POST /api/v1/task/:id/stop               Stop task
-  DELETE /api/v1/task/:id                  Delete task
-  GET  /api/tasks                          List dynamic tasks
+  GET  /api/tasks                          List tasks
   POST /api/tasks                          Create task (config JSON)
   GET  /api/tasks/:id                      Task detail
   PUT  /api/tasks/:id                      Update task (auto-reload)
   DELETE /api/tasks/:id                    Delete task (stops if active)
-  POST /api/tasks/:id/reload               Force reload
+  POST /api/tasks/:id/reload               Reload (rebuild + start)
+  POST /api/tasks/:id/stop                 Stop instance, keep config
   GET  /api/v1/monitor/overview            Fleet overview
   GET  /api/v1/monitor/task/:id            Per-task metrics
   POST /api/v1/reconcile/run               Trigger reconciliation
@@ -171,7 +166,7 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/monitor/ove
 
 ## Testing
 
-243 unit tests across transform (69), CDC (47), auth (25), engine (22), reconcile (19), alarm (15), web (15), sink (14), meta (8) and others — green on both SQLite and MySQL builds.
+256 unit tests across transform (69), CDC (47), auth (25), engine (22), reconcile (19), alarm (15), web (15), sink (14), meta (8) and others — green on both SQLite and MySQL builds. A live MySQL pool regression test (child-thread acquire path) runs when `ZETL_LIVE_MYSQL=1` is set and skips otherwise.
 
 ## Project Structure
 
@@ -203,8 +198,8 @@ src/
 
 ## Dependencies
 
-- [zfinal](https://github.com/chy3xyz/zfinal) v0.27.0 — web framework, DB drivers, token management (pinned via git+https in `build.zig.zon`; pulls in zent v0.31.0 transitively)
-- Zig 0.17.0-dev.1970 — compiler and standard library (required by zfinal v0.26.1+)
+- [zfinal](https://github.com/chy3xyz/zfinal) v0.28.11 — web framework, DB drivers, token management (pinned via git+https in `build.zig.zon`; pulls in zent v0.78.0 transitively)
+- Zig 0.17.0 — compiler and standard library (required by zfinal v0.28.1+)
 - MySQL 8.x — sink database (libmysqlclient)
 - SQLite 3 — metadata store (system library)
 

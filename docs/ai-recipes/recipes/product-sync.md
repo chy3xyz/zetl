@@ -2,7 +2,7 @@
 
 ## 目标
 
-源端商品表用 camelCase 列名 (`productName`, `unitPrice`), 目标端标准命名是 snake_case. 用 Phase 6b 的 `naming_rule: "camel_to_snake"` 自动转换, 无需手工写 `field_mappings_json`.
+源端商品表用 camelCase 列名 (`productName`, `unitPrice`), 目标端标准命名是 snake_case. 用 Phase 6b 的 `naming_rule: "camel_to_snake"` 自动转换, 无需手工写 `field_mappings`.
 
 ## 源表 `mall_001.products` 结构 (驼峰)
 
@@ -31,36 +31,26 @@ CREATE TABLE product (
 );
 ```
 
-## 完整 `config_json`
+## 请求体 (`POST /api/tasks`)
 
-```json
-{
-  "name": "product-sync-from-mall-001",
-  "sync_mode": "both",
-  "source": {
-    "host": "polar-001.local", "port": 3306,
-    "user": "etl", "password": "<encrypted>",
-    "db": "mall_001", "table": "products",
-    "mall_id": "mall-001"
-  },
-  "target": {
-    "host": "central.local", "port": 3306,
-    "user": "etl", "password": "<encrypted>",
-    "db": "central", "table": "product"
-  },
-  "transform": {
-    "naming_rule": "camel_to_snake"
-  },
-  "sink": {
-    "on_conflict": "replace"
-  }
-}
+```bash
+curl -X POST http://127.0.0.1:18080/api/tasks \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "name": "product-sync-from-mall-001",
+    "source_db": "mall-001",
+    "source_table": "products",
+    "target_table": "product",
+    "sync_mode": 1,
+    "status": 1,
+    "config_json": "{\"transform\": {\"naming_rule\": \"camel_to_snake\"}}"
+  }'
 ```
 
 ## 字段解读
 
-- `naming_rule: "camel_to_snake"`: `productName` 自动变成 `product_name`, 无需写 `field_mappings_json`.
-- 想加更复杂规则 (比如 `naming_rule: "camel_to_snake"` 后再加 `add_prefix("dt_")`) 用 Phase 6c 的 `naming_rules` 数组, 详见 [reference/transform-naming.md](../reference/transform-naming.md).
+- `config_json.transform.naming_rule: "camel_to_snake"`: `productName` 自动变成 `product_name`, 无需写 `field_mappings`.
+- 想加更复杂规则 (比如 `camel_to_snake` 后再加 `add_prefix("dt_")`) 用 `naming_rules` 数组, 详见 [reference/transform-naming.md](../reference/transform-naming.md).
 
 ## 验证
 

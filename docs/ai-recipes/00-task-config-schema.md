@@ -1,27 +1,51 @@
-# TaskConfig 完整字段参考
-
-下面给出 zetl `config_json` (POST 给 `/api/tasks` 的 body) 的全部字段.
+下面给出 zetl `/api/tasks` 请求体的全部字段.
 
 每行格式: `字段名: 类型 / 必填 / 默认值 / 示例 / 错误信息`.
 
 ---
 
-## 顶层字段
+## 顶层字段 (实际实现, `web/handler/tasks.zig::parseConfigFromJson`)
 
 ```
-name:        string / 必填 / 无 / "order-sync-from-mall-001" / "name required"
-sync_mode:   enum{polling, binlog, both} / 选填 / both / "both" / "invalid sync_mode"
+name:         string / 必填 (name 唯一) / 无 / "order-sync-from-mall-001" / "name/source_db/source_table/target_table 必填"
+source_db:    string / 必填 / 无 / "mall-001" (对应已注册 datasource 的 mall_id) / 同上
+source_table: string / 必填 / 无 / "orders" / 同上
+target_table: string / 必填 / 无 / "union_all_order" / 同上
+sync_mode:    int / 选填 / 1 / 3 (0=full 1=poll 2=binlog 3=both; 其他值回退 poll)
+config_json:  string / 选填 / "{}" / "{\"batch_size\":500}" (嵌套 JSON 字符串, 见下)
+status:       int / 选填 / 1 / 1 (0=disabled 1=active; 其他值 → "status 必须是 0 或 1")
 ```
 
-### `sync_mode` 取值
+- 未知字段被忽略 (`ignore_unknown_fields`), 不会报错.
+- 源端连接 (host/port/user/password) **不在请求体里** — 先 `POST /api/v1/datasource` 注册,
+  `source_db` 填该数据源的 `mall_id`.
+- 目标端连接走全局 `config.toml [sink]` 段, 归集库统一.
 
-- `polling`: 仅全量 + 按 update_time 轮询增量 (Phase 1/2).
-- `binlog`: 仅 binlog CDC (V3).
-- `both`: 全量初始化后自动切 binlog 增量 (推荐).
+## `config_json` 内已实现的透传键 (`engine/scheduler.zig::parseV5Overrides`)
+
+任何键解析失败 / 类型非法 → warn + 该键回退默认 (任务照常启动, 不会 400):
+
+```
+batch_size:             int / 选填 / 1000 / 500 (有效范围 1..100000)
+field_mappings:         string|object|array / 选填 / 无
+                        string: 原样作为 overrides JSON 交给 mapper
+                        object/array: 自动序列化为 JSON 文本
+filter:                 object / 选填 / 无 / {"field":"amount","op":"gte","value":"0"}
+                        op ∈ gte|gt|lte|lt|eq|ne, 行级数值过滤 (engine 生效路径)
+enable_commission_calc: bool / 选填 / false (佣金计算, 见 order-sync recipe)
+transform.naming_rule:  string|object / 选填 / 无 (单规则, 见 reference/transform-naming.md)
+transform.naming_rules: array / 选填 / 无 (链式 pipeline, 优先于 naming_rule 单规则)
+transform.mask_phone / mask_email / mask_id_card / mask_all: bool / 选填 / false
+transform.case_insensitive_fields: bool / 选填 / true
+```
+
+`mall_id` 注入: TransformEngine 自动把 datasource 的 `mall_id` 追加到每行, 无需配置.
+目标表无需预建: Phase 7 `ensureTargetTable` 按 source schema 自动 `CREATE TABLE IF NOT EXISTS`
+(精确 VARCHAR(N)/DECIMAL(P,S), 详见 reference/sink-ddl.md).
 
 ---
 
-## `source` 子对象 (源端连接)
+## `source` 子对象 (⚠️ 规划未实现 — 下方 source/target/sink/schedule 段均为设计稿)
 
 ```
 source.host:     string / 必填 / 无 / "polar-001.local"
@@ -100,7 +124,7 @@ schedule.reconcile:    bool   / 选填 / false
 
 ---
 
-## 完整最小例子
+## 完整最小例子 (⚠️ 规划结构, 非当前 API — 实际例子见各 recipes/)
 
 ```json
 {

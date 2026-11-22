@@ -6,9 +6,10 @@
 
 ## 前置
 
-- 源端 PolarDB 已开 binlog (`binlog_format=ROW`, `binlog_row_image=FULL`).
-- 源端账号权限: `SELECT, REPLICATION SLAVE, REPLICATION CLIENT`.
-- 目标库 `central.union_all_order` 不需要预先建表 (Phase 7 自动 CREATE TABLE IF NOT EXISTS).
+- 先注册 datasource: `POST /api/v1/datasource`, `mall_id: "mall-001"` 指向 `mall_001` 库 (登录 → 注册流程见 [01-quickstart.md](../01-quickstart.md)).
+- binlog 模式 (`sync_mode: 2/3`) 要求源端开 binlog (`binlog_format=ROW`, `binlog_row_image=FULL`) 且账号有 `REPLICATION SLAVE, REPLICATION CLIENT` 权限.
+- 目标库 `union_all_order` 不需要预先建表 (Phase 7 自动 CREATE TABLE IF NOT EXISTS).
+- 佣金计算需要归集库有 `agent_commission_rule` 表 (结构见下文 "佣金规则表").
 
 ## 源表 `mall_001.orders` 结构
 
@@ -43,37 +44,44 @@ CREATE TABLE union_all_order (
 );
 ```
 
-## 完整 `config_json`
+## 请求体 (`POST /api/tasks`)
 
-```json
-{
-  "name": "order-sync-from-mall-001",
-  "sync_mode": "both",
-  "source": {
-    "host": "polar-001.local", "port": 3306,
-    "user": "etl", "password": "<encrypted>",
-    "db": "mall_001", "table": "orders",
-    "mall_id": "mall-001"
-  },
-  "target": {
-    "host": "central.local", "port": 3306,
-    "user": "etl", "password": "<encrypted>",
-    "db": "central", "table": "union_all_order"
-  },
-  "transform": {
-    "commission": {
-      "rate": 0.05,
-      "amount_field": "order_total",
-      "output_field": "agent_commission",
-      "rate_field": "commission_rate"
-    }
-  },
-  "sink": {
-    "on_conflict": "replace",
-    "batch_size": 200
-  }
-}
+```bash
+curl -X POST http://127.0.0.1:18080/api/tasks \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "name": "order-sync-from-mall-001",
+    "source_db": "mall-001",
+    "source_table": "orders",
+    "target_table": "union_all_order",
+    "sync_mode": 3,
+    "status": 1,
+    "config_json": "{\"batch_size\": 200, \"enable_commission_calc\": true}"
+  }'
 ```
+
+- `source_db: "mall-001"` → 关联 datasource, 其 `mall_id` 自动注入每行 (与 order_no 组成归集侧唯一键).
+- `sync_mode: 3` (both) = 全量初始化后自动切 binlog 增量.
+- `config_json.enable_commission_calc: true` 启用佣金计算 — 规则不是写死在配置里,
+  而是从归集库 `agent_commission_rule` 表动态加载 (status=1 的规则), 不可达时降级空规则并 5min 自动重试.
+
+## 佣金规则表 (归集库)
+
+```sql
+CREATE TABLE IF NOT EXISTS agent_commission_rule (
+  id              INT PRIMARY KEY AUTO_INCREMENT,
+  agent_id        VARCHAR(64)  NOT NULL,
+  mall_id         VARCHAR(32)  NOT NULL,
+  min_amount      DECIMAL(10,2) NOT NULL,
+  max_amount      DECIMAL(10,2) NOT NULL,
+  commission_rate DECIMAL(5,4)  NOT NULL,
+  status          INT NOT NULL DEFAULT 1
+);
+```
+
+计算逻辑 (硬编码字段名, 无需配置): 取行内 `order_total` 金额 + `agent_id`, 按
+`(mall_id, agent_id, min_amount <= order_total < max_amount)` 匹配区间费率,
+输出 `agent_commission` (金额) 与 `commission_rate` (费率) 两列. 未匹配到规则时两列为空.
 
 ## 字段解读
 

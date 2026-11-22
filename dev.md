@@ -2,6 +2,83 @@
 
 ## 日志
 
+### 2026-11-21 (5): 任务系统收敛 — V5 /api/tasks 为唯一 (legacy /api/v1/task 移除)
+- 决策: 保留 V5 (tasks_config 表, config_json 透传, 动态管理), 删除 legacy
+  /api/v1/task (sync_task 表) — 两套任务系统双轨维护成本高.
+- **V5 能力补齐**: `POST /api/tasks/:id/stop` (停实例留配置, scheduler.stopTaskById);
+  reloadTask 增加 status=disabled 分支 (停用 = stop + 不启动, 修复 disabled 任务
+  reload 后照样启动的缺口); PUT /api/tasks/:id 按 status 分支.
+- **消费方迁移**: UI 任务页 (表单字段 source_db/嵌套 config_json/启停按钮),
+  reconcile cron (getById + findByMallId, 原 datasource_id 关联), monitor.taskMetrics,
+  metrics.globalOverview (running=active, error=fail_count>0), main 启动只调 loadFromDb,
+  store FK 指向 tasks_config, datasource.hasTaskBinding 按 mall_id 关联.
+- **删除**: legacy 6 端点 + web/handler/task.zig + V1 SyncTask model/Service +
+  scheduler.startTask/stopTask/bootstrapAll + sync_task 建表 DDL (runtime markError
+  不再回写 sync_task, 失败态由 runtime_metrics 承载).
+- 端点 37 → 32. 测试 256 → 255 (-startTask 测试, V1 Service 测试随删除).
+- **全生命周期 E2E**: create(running) → stop(stopped) → update status=0(disabled)
+  → update status=1(reloaded) → overview/monitor V5 统计正确 → sink 同步正常.
+- 遗留: reconcile run 端点 ({mall_id, table_name} 路径) 在 E2E 中 ExecFailed —
+  存量问题 (本轮未触碰该路径), 待单独排查.
+
+### 2026-11-21 (4): 自动建表幂等唯一键 + 死字段清理
+- **自动建表追加 `UNIQUE KEY uk_zetl_mall_pk (mall_id, pk_column)`**: 之前自动
+  创建的目标表没有任何唯一键, sink 的 INSERT ... ON DUPLICATE KEY UPDATE 无法
+  去重 — 源行 UPDATE (update_time 刷新) 后 re-sync 会重复插入. 现在 DDL 按源
+  主键 (cfg.pk_column) 生成唯一键; pk 不在源列中则跳过 (幂等降级, 与现有
+  ensureTargetTable warn 语义一致). live E2E 实测: UPDATE re-sync 原位更新,
+  行数不增.
+- **移除 `TransformConfig.filter_condition` 死字段**: 该字段被 store/dupe/free
+  但 process() 从不消费 (生效过滤路径是 filter_field/op/value). RuntimeConfig
+  侧字段保留 (legacy API 兼容), 注释已注明 inert.
+- 测试 253 → 256 (+唯一键 3); 双构建全绿.
+
+### 2026-11-21 (3): AI 速搭文档对齐真实 API + 三个存量 bug 修复
+- **ai-recipes 全面重写**: quickstart / 00-schema 顶层 / 4 个 recipes / api-tasks
+  全部对齐真实 API (扁平请求体 + config_json 嵌套字符串 / 响应信封 {code,msg,data} /
+  创建即启动 running|stored_only / 端口 18080); 之前教 AI 写的 source/target/sink
+  子对象结构根本不被 API 接受. transform-naming/overrides 补嵌套位置说明.
+- **quickstart 文档按步实测** (本地 MySQL 全链路): 登录→注册数据源→建任务→
+  全量+增量同步→sink 行数一致. 实测过程中暴露并修复三个**存量 bug**:
+  1. `runtime.start()` CAS 语义写反: cmpxchgStrong 返回 null=成功, 原代码把成功
+     当失败继续循环, 第二圈读到刚写入的 .running → 必然返回 AlreadyRunning —
+     **所有任务都启动不了** (旧 E2E 靠手工预建表掩盖).
+  2. `fetchSourceColumns` 用 `_sh`(host) 当表名 → SHOW COLUMNS 恒失败 →
+     自动建表/自动列映射全废. 改为 cfg.source_table.
+  3. `buildCreateTable` 缺治理列 → sink flush 的 INSERT (含 mall_id/sync_type/
+     sync_time/is_delete/source_*) 首次增量必报 Unknown column. DDL 追加治理列,
+     与 flush 列集对齐.
+- **bootstrap admin 修复**: 全新部署时引导账号只存在于 config, RBAC 中间件按
+  user 表校验 → 登录成功但受保护端点全 403. 新增
+  `auth.user.ensureBootstrapAdmin` (幂等: 建 user + 绑 admin 角色), main 启动时注入.
+- 测试 252 → 253 (+ensureBootstrapAdmin); SQLite + MySQL 双构建全绿.
+
+### 2026-11-21 (2): V5 config_json 透传 + 调度器重构
+- **config_json 透传落地** (scheduler.zig TODO Phase 6): V5 动态任务现在支持
+  batch_size / field_mappings (string|object|array) / filter {field,op,value} /
+  enable_commission_calc / transform.* (naming_rules + mask 开关); 解析失败
+  warn + 回退默认 (与 commission 降级哲学一致). RuntimeConfig 相应扩展
+  filter_field/op/value + mask 字段, SyncTask.init 全部转发给 TransformEngine.
+- **提取 buildSyncTask 公共函数** (TODO 落地): addTask(V5)/reloadTask 两处
+  重复构造收口; 顺带修复 "SyncTask.init 失败泄漏 src_pool + 字符串" 的老限制.
+- **token_user_map TTL 清扫**: 绑定带 bound_at_ms, bindTokenToUser 机会式
+  清扫 (>10min 周期, TTL 2h = token TTL 1h 的 2 倍), 未 logout 的绑定不再常驻内存.
+- 发现并标注: `TransformConfig.filter_condition` 是 engine 死字段 (生效路径
+  是 filter_field/op/value 数值比较); V5 config_json 的 filter 走生效路径.
+- **ai-recipes 文档漂移修正**: 00-task-config-schema.md 顶层结构与实际 API
+  不符 (source/target/sink/schedule 为规划未实现), 已加实现状态声明 +
+  已实现 config_json 词汇表; recipes 全量对齐真实 API 留待后续.
+- 单元测试 244 → 252 (scheduler 透传 6 + deps sweep 1); 双构建全绿.
+
+### 2026-11-21
+- zfinal v0.27.0 → v0.28.11, Zig 0.17.0-dev.1970 → **0.17.0 stable** (v0.27.1 钉 dev.2151, v0.28.1 起 stable; zent v0.31.0 → v0.78.0 经传递拉取)
+- zetl 主代码零改动通过 (v0.28 公开 API 未变; pool 内部重构 mutex_init 移除)
+- **已知问题 #1 (子线程 MySQL acquire `Lost connection`) 实测已修复**: 新增
+  `src/pool_mysql_live_test.zig` env 门控 live 测试 (`ZETL_LIVE_MYSQL=1 zig build -Ddriver_mysql=true test`),
+  双 worker 子线程并发 acquire + query + upsert 实测通过
+- 修复 `/api/v1/auth/me`: RBAC 用户现在返回真实用户名 (原来恒返回 config 引导账号 admin)
+- 0.17.0 stable API 备忘: `std.process.hasEnvVarConstant/getEnvVarOwned` 已移除, live 测试门控改用 `std.c.getenv` (与 zfinal 同款模式)
+
 ### 2026-09-17 (2): 源码结构整理
 - **HTTP handler 统一收口到 `web/handler/`**: `web/api/tasks.zig` → `handler/tasks.zig`;
   domain 模块的 4 个 handler 移入 (`alarm/audit/reconcile/handler.zig` → `web/handler/`),
