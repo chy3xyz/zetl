@@ -113,12 +113,19 @@ const cfg = .{ .host = host }; // 指向堆
 ## 测试
 
 ```
-255 个单元测试 (zig build test / zig build -Ddriver_mysql=true test):
+262 个单元测试 (zig build test / zig build -Ddriver_mysql=true test):
   transform (69) / cdc (47, 含 binlog decoder 22) / auth (26, 含 bootstrap admin 1)
   / engine (29, 含 V5 config_json 透传 6) / reconcile (19) / alarm (15)
-  / web (16, 含 deps sweep 1)
-  / sink (17, 含 DDL 唯一键 3) / meta (8) / audit (3) / main (2) / config (2) / common (2)
+  / web (23, 含 deps sweep 1 + /api/tasks handler 层 5)
+  / sink (17, 含 DDL 唯一键 3) / meta (10, 含 findByName 2) / audit (3)
+  / main (2) / config (2) / common (2)
   / pool live (1, env 门控默认 SKIP)
+
+handler 层测试模式: zfinal oneshot.capture (无 TCP, Router.execute + capture ctx),
+见 src/web/handler/tasks_http_test.zig — 三个分配器必须统一为同一 allocator
+(ctx.allocator / deps.allocator_ptr / store.allocator), 否则跨分配器 free
+静默泄漏或 panic. zfinal capture 已预置空 query_params (acf2257, getPara
+返回 null → handler 默认值); build.zig.zon 当前 pin 该 commit 而非 tag.
 
 SQLite + MySQL 双构建通过; live MySQL 测试需 ZETL_LIVE_MYSQL=1 (见已知问题 #1);
 已知怪癖: 重建后首次 zig build test 可能打印一行 "failed command" 但退出码为 0

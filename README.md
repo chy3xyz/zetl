@@ -4,7 +4,7 @@ A lightweight data aggregation engine that consolidates tables from multiple MyS
 
 [![Zig](https://img.shields.io/badge/Zig-0.17.0-orange)](https://ziglang.org)
 [![zfinal](https://img.shields.io/badge/zfinal-v0.28.11-blue)](https://github.com/chy3xyz/zfinal)
-[![Tests](https://img.shields.io/badge/tests-256%20passing-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-262%20passing-brightgreen)](#testing)
 
 ```
 source MySQL ──> Poller (PK pagination / update_time) or Binlog reader ──> RowEvent
@@ -166,7 +166,7 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18080/api/v1/monitor/ove
 
 ## Testing
 
-256 unit tests across transform (69), CDC (47), auth (25), engine (22), reconcile (19), alarm (15), web (15), sink (14), meta (8) and others — green on both SQLite and MySQL builds. A live MySQL pool regression test (child-thread acquire path) runs when `ZETL_LIVE_MYSQL=1` is set and skips otherwise.
+262 unit tests across transform (69), CDC (47), auth (25), engine (22), reconcile (19), alarm (15), web (15), sink (14), meta (8) and others — green on both SQLite and MySQL builds. A live MySQL pool regression test (child-thread acquire path) runs when `ZETL_LIVE_MYSQL=1` is set and skips otherwise.
 
 ## Project Structure
 

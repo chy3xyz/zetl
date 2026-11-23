@@ -132,6 +132,22 @@ E2E 实测对账路径, 逐层暴露并修复:
   diff_count=1/diff_amount=11 (阈值内 is_abnormal=false, 符合配置语义);
   记录落库; 无 panic. 测试 255 (255+live skip), 双构建全绿.
 
+### 2026-11-23 (2): name 唯一性友好错误 + handler 层测试 (oneshot capture)
+- **tasks_config 撞名**: create/update 前置 findByName 预检 → business_error
+  "任务名已存在" (此前撞 SQLite UNIQUE 报 system_error 不可读); update 场景
+  findByName 命中必须是本 id (改名碰撞检测).
+- **handler 层测试落地**: `web/handler/tasks_http_test.zig` 用 zfinal
+  `oneshot.capture` (无 TCP, Router.execute + capture ctx), 5 个用例覆盖
+  create→list→detail / 撞名 / 缺字段 / 非法 status / 404.
+- **上游 zfinal 补丁** (acf2257, 已推送): capture 模式预置空 query_params —
+  此前 getPara* 会读 undefined req 直接段错误; zetl pin 从 v0.28.11 tag
+  前移到该 commit.
+- **测试环境三分配器铁律**: ctx.allocator / deps.allocator_ptr /
+  store.allocator 必须同一 allocator (handler free body 与 Service 返回的
+  TaskConfig), 否则跨分配器 free → 静默泄漏或 "free of invalid memory" panic.
+  TestEnv 因此放弃 arena, 全 testing.allocator + errdefer 逆向清理.
+- 测试 256 → 262 (handler 层 5 + findByName 2); 双构建全绿零泄漏.
+
 ## 架构决策
 
 1. **元数据 SQLite + 业务 MySQL** — 元数据量小(< 100 数据源), 单文件便于备份
