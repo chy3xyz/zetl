@@ -129,6 +129,7 @@ test {
     _ = @import("web/handler/auth.zig");
     _ = @import("pool_mysql_live_test.zig"); // env 门控 live MySQL pool 测试
     _ = @import("web/handler/tasks.zig");
+    _ = @import("web/handler/tasks_http_test.zig"); // /api/tasks handler 层 (oneshot capture)
     _ = @import("config.zig");
 }
 

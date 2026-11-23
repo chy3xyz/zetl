@@ -71,6 +71,19 @@ pub const Service = struct {
         return null;
     }
 
+    /// 按任务名查 (唯一性预检用). 未找到返回 null.
+    pub fn findByName(self: *Service, name: []const u8) !?TaskConfig {
+        const a = self.store.allocator;
+        const sql: [:0]const u8 =
+            "SELECT " ++ SQL_COLUMNS ++ " FROM tasks_config WHERE name = $1";
+        var result = try self.store.db.queryParams(sql, &.{.{ .text = name }});
+        defer result.deinit();
+        if (result.next()) {
+            if (result.getCurrentRowMap()) |row| return try rowToConfig(a, row);
+        }
+        return null;
+    }
+
     pub fn list(self: *Service, filter: ?TaskActiveStatus) ![]TaskConfig {
         const a = self.store.allocator;
 
@@ -282,4 +295,47 @@ test "Service setStatus toggles active/disabled" {
         defer got.deinit(a);
         try std.testing.expectEqual(TaskActiveStatus.active, got.status);
     }
+}
+
+test "Service findByName: roundtrip + null for missing" {
+    const a = std.testing.allocator;
+    var db = try store_mod.MetaStore.init(a, ":memory:");
+    defer db.deinit();
+    var svc = Service{ .store = &db };
+
+    const cfg = TaskConfig{
+        .name = "named-task",
+        .source_db = "mall-1",
+        .source_table = "orders",
+        .target_table = "union_all_order",
+    };
+    _ = try svc.create(cfg);
+
+    const found = (try svc.findByName("named-task")).?;
+    defer {
+        var f = found;
+        f.deinit(a);
+    }
+    try std.testing.expectEqualStrings("mall-1", found.source_db);
+
+    const missing = try svc.findByName("no-such-name");
+    try std.testing.expect(missing == null);
+}
+
+test "Service create: duplicate name rejected by UNIQUE constraint" {
+    const a = std.testing.allocator;
+    var db = try store_mod.MetaStore.init(a, ":memory:");
+    defer db.deinit();
+    var svc = Service{ .store = &db };
+
+    const cfg = TaskConfig{
+        .name = "dup",
+        .source_db = "mall-1",
+        .source_table = "orders",
+        .target_table = "t",
+    };
+    _ = try svc.create(cfg);
+    // 同名二次 create → SQLite UNIQUE 兜底报错 (handler 预检给出可读信息)
+    const r = svc.create(cfg);
+    try std.testing.expect(std.meta.isError(r));
 }

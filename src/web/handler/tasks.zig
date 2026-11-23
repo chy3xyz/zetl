@@ -166,6 +166,13 @@ pub fn create(ctx: *zfinal.Context) !void {
     defer cfg.deinit(allocator);
 
     var svc = Service{ .store = deps.store_ptr };
+    // name 唯一性预检 (SQLite UNIQUE 兜底): 撞名给可读错误而非 system_error
+    if (svc.findByName(cfg.name) catch null) |existing| {
+        var e = existing;
+        e.deinit(allocator);
+        try response.fail(ctx, .business_error, "任务名已存在");
+        return;
+    }
     const id = svc.create(cfg) catch |err| {
         try response.fail(ctx, .system_error, @errorName(err));
         return;
@@ -241,6 +248,16 @@ pub fn update(ctx: *zfinal.Context) !void {
         return;
     };
 
+    // 改名场景: 新 name 不得与其他任务冲突 (findByName 命中的必须是本 id)
+    if (svc.findByName(cfg.name) catch null) |existing| {
+        var e = existing;
+        const collides = e.id != id;
+        e.deinit(allocator);
+        if (collides) {
+            try response.fail(ctx, .business_error, "任务名已存在");
+            return;
+        }
+    }
     svc.update(id, cfg) catch |err| {
         try response.fail(ctx, .system_error, @errorName(err));
         return;
