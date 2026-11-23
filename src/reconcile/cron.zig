@@ -21,6 +21,8 @@ pub const CronConfig = struct {
     cron_expr: []const u8 = "@daily",
     /// 唤醒检查周期 (秒)
     poll_interval_s: u64 = 60,
+    /// 对账金额列 (透传给 reconcileAsync; identity 映射下源/汇同名)
+    amount_column: []const u8 = "order_total",
 
     /// 从全局配置转换
     pub fn fromReconcileConfig(rc: config_mod.Config.ReconcileConfig) CronConfig {
@@ -28,9 +30,11 @@ pub const CronConfig = struct {
             .enabled = rc.enabled,
             .cron_expr = rc.cron_expr,
             .poll_interval_s = rc.poll_interval_s,
+            .amount_column = rc.amount_column,
         };
     }
 };
+
 
 /// 5 字段 cron 时间表 (位图)
 /// minutes: 0-59, hours: 0-23, dom: 1-31, month: 1-12, dow: 0-6 (Sun=0)
@@ -184,6 +188,7 @@ pub const CronContext = struct {
         self.allocator.destroy(self);
     }
 };
+
 
 /// 初始化 cron 调度器, 可选启动后台线程
 pub fn init(
@@ -339,13 +344,11 @@ fn runOneTask(
         });
         return err;
     };
-    defer {
-        src_pool.deinit();
-        allocator.destroy(src_pool);
-    }
+    // pool.deinit 内部自毁 (zfinal ConnectionPool self-destroy), 不可再 destroy
+    defer src_pool.deinit();
 
-    // 4. 跑对账
-    const rec_cfg = rec.ReconcileConfig{};
+    // 4. 跑对账 (金额列来自 [reconcile] 配置)
+    const rec_cfg = rec.ReconcileConfig{ .amount_column = ctx.config.amount_column };
     common.logger.inf(
         "[cron] 对账: task={d} ({s}) mall={s} table={s}",
         .{ task_id, task_name, d.mall_id, target_table },
@@ -356,6 +359,7 @@ fn runOneTask(
         src_pool,
         ctx.scheduler.sink_pool,
         d.mall_id,
+        t.source_table,
         target_table,
         rec_cfg,
     ) catch |err| {

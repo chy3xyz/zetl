@@ -165,6 +165,16 @@ const cron_ctx = reconcile.cron.init(allocator, scheduler, &store, cron_cfg) cat
 defer cron_ctx.deinit();   // 进程退出时优雅停机
 ```
 
+### 对账语义 (2026-11-23 修复后)
+- `reconcileAsync(mall_id, source_table, target_table, cfg)`: 源表名与汇表名分离
+  (handler 从 tasks_config 反查 source_table; cron 透传)
+- 源侧整表 COUNT/SUM (`filter_mall=false` — 源业务表无 mall_id 治理列);
+  汇侧按 mall_id 过滤
+- 金额列可配: `ReconcileConfig.amount_column` (默认 "order_total"),
+  `[reconcile]` 配置段 / `POST /api/v1/reconcile/run` 请求体均可覆盖
+- MySQL 查询路径无 `$1` 占位符 (queryParams 需 `?` 走 stmt) — 字面量插值同 poller
+- ConnectionPool.deinit 内部自毁, 不可再 destroy (见核心 API 约定)
+
 新测试 (9 个):
 - `cron parse @daily / @hourly / @weekly / @monthly` — 简写解析
 - `cron parse 5-field` — 标准 5 字段 + 越界拒绝

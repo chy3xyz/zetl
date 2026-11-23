@@ -39,6 +39,9 @@ pub const ReconcileConfig = struct {
     diff_count_threshold: i64 = 5,
     diff_amount_threshold: f64 = 100.0,
     retention_days: u32 = 90,
+    /// 对账金额列名. 硬编码 "order_total" 的历史: 对账只适配订单表;
+    /// 泛化后由调用方按业务表传入 (identity 映射下源/汇列名一致).
+    amount_column: []const u8 = "order_total",
 };
 
 /// V2.1+ cron 调度子模块

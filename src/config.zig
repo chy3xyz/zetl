@@ -51,6 +51,8 @@ pub const Config = struct {
         enabled: bool = true,
         cron_expr: []const u8 = "@daily",
         poll_interval_s: u64 = 60,
+        /// 对账金额列 (identity 映射下源/汇同名); 默认适配订单表.
+        amount_column: []const u8 = "order_total",
     };
 
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {

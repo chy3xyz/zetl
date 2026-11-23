@@ -17,18 +17,20 @@ pub fn reconcileAsync(
     src_pool: *zfinal.ConnectionPool,
     sink_pool: *zfinal.ConnectionPool,
     mall_id: []const u8,
-    table_name: []const u8,
+    source_table: []const u8,
+    target_table: []const u8,
     cfg: rec.ReconcileConfig,
 ) !rec.ReconcileResult {
-    // 1. 源库汇总
+    // 1. 源库汇总 (源表名 ≠ 目标表名; 源业务表没有 mall_id 治理列 —
+    //    一个 datasource 即一个 mall, 源侧按整表统计, filter_mall=false)
     var src_count: i64 = 0;
     var src_amount: f64 = 0;
-    try summaryQuery(allocator, src_pool, mall_id, table_name, &src_count, &src_amount);
+    try summaryQuery(src_pool, source_table, cfg.amount_column, false, "", &src_count, &src_amount);
 
-    // 2. 目标库汇总
+    // 2. 目标库汇总 (汇表带治理列, 按 mall_id 过滤 — 多 mall 归集场景)
     var tgt_count: i64 = 0;
     var tgt_amount: f64 = 0;
-    try summaryQuery(allocator, sink_pool, mall_id, table_name, &tgt_count, &tgt_amount);
+    try summaryQuery(sink_pool, target_table, cfg.amount_column, true, mall_id, &tgt_count, &tgt_amount);
 
     const diff_count = src_count - tgt_count;
     const diff_amount = src_amount - tgt_amount;
@@ -38,18 +40,18 @@ pub fn reconcileAsync(
     const is_abnormal = count_abnormal or amount_abnormal;
 
     // 3. 写入 reconcile_record (SQLite)
-    const record_id = try saveRecord(store, mall_id, table_name, src_count, tgt_count, diff_count, src_amount, tgt_amount, diff_amount, is_abnormal);
+    const record_id = try saveRecord(store, mall_id, target_table, src_count, tgt_count, diff_count, src_amount, tgt_amount, diff_amount, is_abnormal);
 
     // 4. 异常时跑一次增量 diff (抽样)
     var details_json: ?[]u8 = null;
     if (is_abnormal) {
-        details_json = try runDiff(allocator, src_pool, sink_pool, mall_id, table_name, cfg.sample_ratio);
+        details_json = try runDiff(allocator, src_pool, sink_pool, mall_id, target_table, cfg.sample_ratio);
     }
 
     return rec.ReconcileResult{
         .record_id = record_id,
         .mall_id = try allocator.dupe(u8, mall_id),
-        .table_name = try allocator.dupe(u8, table_name),
+        .table_name = try allocator.dupe(u8, target_table),
         .source_count = src_count,
         .target_count = tgt_count,
         .diff_count = diff_count,
@@ -64,21 +66,32 @@ pub fn reconcileAsync(
 
 /// 源库 / 归集库 汇总查询: COUNT(*) + SUM(order_total)
 fn summaryQuery(
-    _: std.mem.Allocator,
     pool: *zfinal.ConnectionPool,
-    mall_id: []const u8,
     table_name: []const u8,
+    amount_col: []const u8,
+    filter_mall: bool,
+    mall_id: []const u8,
     count_out: *i64,
     amount_out: *f64,
 ) !void {
     const conn = try pool.acquire();
     defer pool.release(conn) catch {};
 
-    const sql = try std.fmt.allocPrintSentinel(conn.allocator,
-        "SELECT COUNT(*) AS cnt, COALESCE(SUM(order_total), 0) AS amt FROM `{s}` WHERE mall_id = $1", .{table_name}, 0);
-    defer conn.allocator.free(sql);
-
-    var result = try conn.queryParams(sql, &.{.{ .text = mall_id }});
+    // 源业务表无 mall_id 治理列 (filter_mall=false, 整表统计);
+    // 汇表按 mall_id 过滤 (多 mall 归集场景).
+    var result = blk: {
+        if (filter_mall) {
+            // mall_id 来自 datasource 表 (调用方受控), 沿用 poller 的插值风格
+            // (mall_id 值集受 mall_id 字段约束, 无引号注入面)
+            const sql = try std.fmt.allocPrintSentinel(conn.allocator, "SELECT COUNT(*) AS cnt, COALESCE(SUM(`{s}`), 0) AS amt FROM `{s}` WHERE mall_id = '{s}'", .{ amount_col, table_name, mall_id }, 0);
+            defer conn.allocator.free(sql);
+            break :blk try conn.query(sql);
+        } else {
+            const sql = try std.fmt.allocPrintSentinel(conn.allocator, "SELECT COUNT(*) AS cnt, COALESCE(SUM(`{s}`), 0) AS amt FROM `{s}`", .{ amount_col, table_name }, 0);
+            defer conn.allocator.free(sql);
+            break :blk try conn.query(sql);
+        }
+    };
     defer result.deinit();
 
     if (result.next()) {

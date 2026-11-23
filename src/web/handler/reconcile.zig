@@ -6,6 +6,7 @@ const zfinal = @import("zfinal");
 const reconcile = @import("../../reconcile/mod.zig");
 const summary = @import("../../reconcile/summary.zig");
 const web_deps = @import("../deps.zig");
+const meta = @import("../../meta/mod.zig");
 const response = @import("../response.zig");
 
 /// POST /api/v1/reconcile/run
@@ -15,6 +16,7 @@ pub fn run(ctx: *zfinal.Context) !void {
     const parsed = ctx.parseJsonBody(struct {
         mall_id: []const u8,
         table_name: []const u8 = "union_all_order",
+        amount_column: []const u8 = "order_total",
     }) catch {
         try response.fail(ctx, .param_error, "请求体不合法, 需要 {mall_id, table_name}");
         return;
@@ -27,15 +29,63 @@ pub fn run(ctx: *zfinal.Context) !void {
         return;
     }
 
-    // 需要用 datasource 信息构造源库连接池 (简化: 直接用归集库的 pool 作为演示)
-    // 正式使用时, poller 和 sink 有各自的 pool
-    const cfg = reconcile.ReconcileConfig{};
+    // 按 mall_id 关联 datasource, 为真实源库构造连接池 (与 reconcile/cron.zig runOneTask 同模式).
+    // 修正历史 bug: 之前直接拿 sink_pool 冒充源库, 对源表的 COUNT/SUM 必然 ExecFailed.
+    const ds_opt = meta.datasource.Service.findByMallId(web_deps.store_ptr, allocator, v.mall_id) catch |err| {
+        try response.fail(ctx, .system_error, @errorName(err));
+        return;
+    } orelse {
+        try response.fail(ctx, .business_error, "数据源不存在 (mall_id)");
+        return;
+    };
+    defer {
+        var d = ds_opt;
+        d.deinit(allocator);
+    }
+
+    const src_host = try allocator.dupe(u8, ds_opt.host);
+    defer allocator.free(src_host);
+    const src_db = try allocator.dupe(u8, ds_opt.db_name);
+    defer allocator.free(src_db);
+    const src_user = try allocator.dupe(u8, ds_opt.username);
+    defer allocator.free(src_user);
+    const src_pass = try allocator.dupe(u8, ds_opt.password);
+    defer allocator.free(src_pass);
+    const src_cfg = zfinal.DBConfig{
+        .db_type = .mysql,
+        .host = src_host,
+        .port = ds_opt.port,
+        .database = src_db,
+        .username = src_user,
+        .password = src_pass,
+        .max_connections = 1,
+    };
+    const src_pool = zfinal.ConnectionPool.init(allocator, src_cfg, 1) catch |err| {
+        try response.fail(ctx, .system_error, @errorName(err));
+        return;
+    };
+    // pool.deinit 内部自毁 (zfinal ConnectionPool self-destroy), 不可再 destroy
+    defer src_pool.deinit();
+
+    // source_table 从 tasks_config 反查 (source_db = mall_id 的首个任务); 无任务则退化为同名表.
+    var task_svc = meta.task.service.Service{ .store = web_deps.store_ptr };
+    const active = task_svc.list(.active) catch &[_]meta.task.config.TaskConfig{};
+    var source_table: []const u8 = v.table_name;
+    for (active) |tc| {
+        if (std.mem.eql(u8, tc.source_db, v.mall_id)) {
+            source_table = tc.source_table;
+            break;
+        }
+    }
+
+    const cfg = reconcile.ReconcileConfig{ .amount_column = v.amount_column };
     const result = summary.reconcileAsync(
         allocator,
         web_deps.store_ptr,
-        web_deps.scheduler_ptr.sink_pool, // 暂时用 sink pool 模拟源库 (需真实部署时修正)
+        src_pool,
         web_deps.scheduler_ptr.sink_pool,
         v.mall_id,
+        source_table,
         v.table_name,
         cfg,
     ) catch |err| {

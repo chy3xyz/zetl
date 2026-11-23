@@ -112,6 +112,26 @@
 - 全量 + 增量 (update_time 轮询) 闭环跑通
 - 任务默认 sync_mode 改为 `both` (先全量后增量)
 
+### 2026-11-23: reconcile 修复 (4 层 bug 剥洋葱)
+E2E 实测对账路径, 逐层暴露并修复:
+1. **run handler 拿 sink_pool 冒充源库** (代码注释自曝的 TODO): 按 mall_id 反查
+   datasource, 真实构造源库 pool (与 cron 同模式).
+2. **ConnectionPool double-destroy**: pool.deinit 内部自毁, handler/cron 的
+   `destroy(src_pool)` 再炸一次 → panic. 两处同修 (zfinal 自毁契约 —
+   AGENTS.md 数据库 API 约定已注明 deinit 即销毁).
+3. **源/汇表名混用**: reconcileAsync 单 table_name 双边用 — 源是 orders,
+   汇是 union_all_order. 拆 source_table/target_table; handler 从 tasks_config
+   反查 source_table (source_db=mall_id), cron 透传.
+4. **源侧 SQL 语义两连**: (a) 源业务表没有 mall_id 治理列 — filter_mall 开关,
+   源侧整表统计 (一个 datasource 即一个 mall), 汇侧按 mall_id 过滤;
+   (b) `$1` 占位符在 MySQL 查询路径无效 (queryParams 走 stmt 需 `?`,
+   插值需字面量) — 沿用 poller 的字面量插值风格.
+- 金额列可配: `ReconcileConfig.amount_column` (默认 order_total) +
+  `[reconcile]` 配置段 + run 请求体可选 amount_column.
+- Live E2E: 一致场景 diff=0 (金额双边 349.5); 停任务后源多插一行 →
+  diff_count=1/diff_amount=11 (阈值内 is_abnormal=false, 符合配置语义);
+  记录落库; 无 panic. 测试 255 (255+live skip), 双构建全绿.
+
 ## 架构决策
 
 1. **元数据 SQLite + 业务 MySQL** — 元数据量小(< 100 数据源), 单文件便于备份
